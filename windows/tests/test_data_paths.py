@@ -58,6 +58,36 @@ def test_portable_data_migrates_from_adjacent_legacy_folder(tmp_path: Path, monk
     assert not legacy_data.exists()
 
 
+def test_development_data_uses_the_same_user_profile_as_installed_app(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    base_dir = tmp_path / "checkout"
+    install_data = base_dir / "data"
+    local_app_data = tmp_path / "LocalAppData"
+    monkeypatch.setattr(data_paths.sys, "frozen", False, raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.delenv("APPDATA", raising=False)
+
+    result = data_paths.resolve_data_dir(base_dir, install_data, "Lumen")
+
+    assert result == local_app_data / "Lumen" / "data"
+
+
+def test_seed_user_data_keeps_checkout_state_when_user_profile_exists(tmp_path: Path) -> None:
+    source = tmp_path / "checkout" / "data"
+    target = tmp_path / "LocalAppData" / "Lumen" / "data"
+    source.mkdir(parents=True)
+    target.mkdir(parents=True)
+    (source / "state.enc").write_bytes(b"checkout-state")
+    (target / "state.enc").write_bytes(b"user-state")
+
+    data_paths.seed_user_data(source, target)
+
+    assert (source / "state.enc").read_bytes() == b"checkout-state"
+    assert (target / "state.enc").read_bytes() == b"user-state"
+
+
 def test_failed_legacy_cleanup_is_retried_without_overwriting_new_state(tmp_path: Path, monkeypatch) -> None:
     legacy = tmp_path / "Lumen KVN" / "data"
     legacy.mkdir(parents=True)

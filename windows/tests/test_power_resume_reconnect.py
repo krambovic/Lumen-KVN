@@ -19,6 +19,7 @@ from xray_fluent.power_reconnect import (
     power_broadcast_event,
     should_arm_resume_reconnect,
 )
+from xray_fluent.storage import StateStorage
 
 
 def _controller(
@@ -73,11 +74,12 @@ def test_resume_setting_is_persisted_and_defaults_to_enabled() -> None:
     assert settings.to_dict()["reconnect_after_sleep"] is False
 
 
-def test_bridge_updates_resume_setting() -> None:
+def test_bridge_updates_resume_setting(tmp_path: Path) -> None:
     QCoreApplication.instance() or QCoreApplication([])
     from xray_fluent.qml_app.bridge import AppBridge
 
     bridge = AppBridge()
+    bridge.controller.storage = StateStorage(tmp_path / "state.json")
     try:
         bridge.setReconnectAfterSleep(False)
         assert bridge.reconnectAfterSleep is False

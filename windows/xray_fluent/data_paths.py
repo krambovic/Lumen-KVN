@@ -244,7 +244,11 @@ def _portable_marker_present(base_dir: Path) -> bool:
 
 def resolve_data_dir(base_dir: Path, install_data_dir: Path, app_name: str) -> Path:
     if not getattr(sys, "frozen", False):
-        return install_data_dir
+        # Development launches must use the same profile as the installed
+        # application.  Keeping state below the checkout makes ``py
+        # run_qml.py`` appear to reset settings whenever the user switches
+        # between the dev launcher and the packaged executable.
+        return user_data_dir(app_name)
     if _portable_marker_present(base_dir) and is_writable(install_data_dir):
         legacy_roots = tuple(base_dir.parent / legacy_folder for legacy_folder in LEGACY_APP_NAMES)
         _migrate_first_legacy_data(
@@ -282,11 +286,7 @@ def seed_user_data(src: Path, dst: Path) -> None:
                 shutil.copy2(source, target)
             except Exception:
                 continue
-        if target.exists():
-            try:
-                source.unlink()
-            except Exception:
-                pass
+
 
 
 _install_id_cache: str | None = None
