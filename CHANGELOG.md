@@ -1,9 +1,9 @@
 ## What's Changed
 
-- feat: added the optional VPN conflict guard to the Startup and tests settings, enabled by default
-- fix: allow Lumen to start alongside other VPN/proxy processes when the guard is disabled
-- fix: hardened portable startup and version-file handling after updates
-- fix: repaired Windows autostart registration without silently changing the user's preference
-- test: added regression coverage for the conflict guard and updater startup paths
+- feat: added translated descriptions for TLS fragmentation and multiplexing to all desktop UI languages
+- fix: moved VPN recovery after sleep to the Startup and tests settings
+- fix: use one user profile for development and installed desktop launches
+- fix: hardened Windows power-state handling and shutdown lifecycle
+- test: added regression coverage for power resume, shutdown and shared profile paths
 
-Full Changelog: https://github.com/krambovic/Lumen/compare/v1.9.8...v1.9.9
+Full Changelog: https://github.com/krambovic/Lumen/compare/v1.9.9...v1.9.10

@@ -879,10 +879,6 @@ Item {
                     Switch { checked: App.reconnectOnNetworkChange; onToggled: App.setReconnectOnNetworkChange(checked) }
                 }
                 SettingRow {
-                    glyph: "\uE7E8"; title: I18n.t("Восстанавливать VPN после сна"); subtitle: I18n.t("Автоматически переподключаться после выхода Windows из сна или гибернации")
-                    Switch { checked: App.reconnectAfterSleep; onToggled: App.setReconnectAfterSleep(checked) }
-                }
-                SettingRow {
                     visible: page.showAdvancedSettings
                     glyph: "\uE968"; title: I18n.t("Предпочитать IPv6"); subtitle: I18n.t("Использовать IPv6-адреса раньше IPv4, если сервер и сеть это поддерживают")
                     Switch { checked: App.preferIpv6; onToggled: App.setPreferIpv6(checked) }
@@ -894,7 +890,7 @@ Item {
                 SettingRow {
                     visible: page.showAdvancedSettings
                     Layout.fillWidth: true
-                    glyph: "\uE8A6"; title: I18n.t("Фрагментирование"); subtitle: I18n.t("TLS Fragment")
+                    glyph: "\uE8A6"; title: I18n.t("Фрагментирование"); subtitle: I18n.t("Разделять TLS ClientHello на части для обхода DPI; иногда снижает стабильность")
                     InfoIcon { tip: I18n.t("Фрагментирование делит TLS-рукопожатие на части. Может помочь обходу DPI, но иногда снижает стабильность.") }
                     Switch { checked: App.fragmentationEnabled; onToggled: App.setFragmentation(checked) }
                 }
@@ -910,7 +906,7 @@ Item {
                 SettingRow {
                     visible: page.showAdvancedSettings
                     Layout.fillWidth: true
-                    glyph: "\uE7C3"; title: I18n.t("Мультиплексирование"); subtitle: I18n.t("Multiplex")
+                    glyph: "\uE7C3"; title: I18n.t("Мультиплексирование"); subtitle: I18n.t("Объединять несколько соединений в один канал; зависит от поддержки сервера")
                     InfoIcon { tip: I18n.t("Мультиплексирование объединяет несколько запросов в один канал. Может ускорить много мелких соединений, но зависит от поддержки сервера.") }
                     Switch { checked: App.multiplexingEnabled; onToggled: App.setMultiplexing(checked) }
                 }
@@ -1084,6 +1080,10 @@ Item {
                 SettingRow {
                     glyph: "\uE768"; title: I18n.t("Автоподключение после запуска"); subtitle: I18n.t("Подключаться к последнему использованному серверу при старте")
                     Switch { checked: App.autoConnectLast; onToggled: App.setAutoConnectLast(checked) }
+                }
+                SettingRow {
+                    glyph: "\uE7E8"; title: I18n.t("Восстанавливать VPN после сна"); subtitle: I18n.t("Автоматически переподключаться после выхода Windows из сна или гибернации")
+                    Switch { checked: App.reconnectAfterSleep; onToggled: App.setReconnectAfterSleep(checked) }
                 }
                 SettingRow {
                     glyph: "\uE72E"; title: I18n.t("Проверка VPN"); subtitle: I18n.t("Не запускать Lumen при работающем другом VPN или прокси")
