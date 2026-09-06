@@ -581,7 +581,9 @@ class UpdateDownloader(QThread):
         super().__init__(parent)
         self._update = update
         self._proxy_url = proxy_url
-        self._restart_in_tray = restart_in_tray
+        # Kept as an API-compatible argument for older callers. An update is
+        # always an interactive relaunch and must reopen visibly.
+        del restart_in_tray
         self._cancelled = threading.Event()
         self._responses: list[object] = []
         self._response_lock = threading.Lock()
@@ -965,11 +967,7 @@ class UpdateDownloader(QThread):
                     "        Move-Item -LiteralPath $_.FullName -Destination $appDir -Force",
                     "    }",
                     "    if (-not (Test-Path -LiteralPath $exePath)) { throw 'Updated Lumen.exe was not found' }",
-                    (
-                        "    $started = Start-Process -FilePath $exePath -ArgumentList '--tray' -WorkingDirectory $appDir -PassThru -ErrorAction Stop"
-                        if self._restart_in_tray
-                        else "    $started = Start-Process -FilePath $exePath -WorkingDirectory $appDir -PassThru -ErrorAction Stop"
-                    ),
+                    "    $started = Start-Process -FilePath $exePath -ArgumentList '--relaunched' -WorkingDirectory $appDir -PassThru -ErrorAction Stop",
                     "    Start-Sleep -Seconds 5",
                     "    if ($started.HasExited) {",
                     "        throw ('Updated application exited immediately with code ' + $started.ExitCode)",
@@ -980,11 +978,7 @@ class UpdateDownloader(QThread):
                     "    }",
                     "}",
                     "catch {",
-                    (
-                        "    if (Test-Path -LiteralPath $exePath) { Start-Process -FilePath $exePath -ArgumentList '--tray','--relaunched' -WorkingDirectory $appDir -ErrorAction SilentlyContinue | Out-Null } elseif (Test-Path -LiteralPath $fallbackExe) { Start-Process -FilePath $fallbackExe -ArgumentList '--tray','--relaunched' -WorkingDirectory $currentAppDir -ErrorAction SilentlyContinue | Out-Null }"
-                        if self._restart_in_tray
-                        else "    if (Test-Path -LiteralPath $exePath) { Start-Process -FilePath $exePath -ArgumentList '--relaunched' -WorkingDirectory $appDir -ErrorAction SilentlyContinue | Out-Null } elseif (Test-Path -LiteralPath $fallbackExe) { Start-Process -FilePath $fallbackExe -ArgumentList '--relaunched' -WorkingDirectory $currentAppDir -ErrorAction SilentlyContinue | Out-Null }"
-                    ),
+                    "    if (Test-Path -LiteralPath $exePath) { Start-Process -FilePath $exePath -ArgumentList '--relaunched' -WorkingDirectory $appDir -ErrorAction SilentlyContinue | Out-Null } elseif (Test-Path -LiteralPath $fallbackExe) { Start-Process -FilePath $fallbackExe -ArgumentList '--relaunched' -WorkingDirectory $currentAppDir -ErrorAction SilentlyContinue | Out-Null }",
                     "    New-Item -ItemType Directory -Path $logDir -Force | Out-Null",
                     "    ($_ | Out-String) | Set-Content -LiteralPath $errorLog -Encoding UTF8",
                     "    throw",
@@ -1106,22 +1100,14 @@ class UpdateDownloader(QThread):
                     "    if ($legacyRootProgram -ine $appDir -and ((Test-Path -LiteralPath $legacyRootExe) -or (Test-Path -LiteralPath $legacyRootOldExe))) {",
                     "        Remove-Item -LiteralPath $legacyRootProgram -Recurse -Force -ErrorAction SilentlyContinue",
                     "    }",
-                    (
-                        "    $started = Start-Process -FilePath $exePath -ArgumentList '--tray' -WorkingDirectory $appDir -PassThru -ErrorAction Stop"
-                        if self._restart_in_tray
-                        else "    $started = Start-Process -FilePath $exePath -WorkingDirectory $appDir -PassThru -ErrorAction Stop"
-                    ),
+                    "    $started = Start-Process -FilePath $exePath -ArgumentList '--relaunched' -WorkingDirectory $appDir -PassThru -ErrorAction Stop",
                     "    Start-Sleep -Seconds 5",
                     "    if ($started.HasExited) {",
                     "        throw ('Updated application exited immediately with code ' + $started.ExitCode)",
                     "    }",
                     "}",
                     "catch {",
-                    (
-                        "    if (Test-Path -LiteralPath $exePath) { Start-Process -FilePath $exePath -ArgumentList '--tray','--relaunched' -WorkingDirectory $appDir -ErrorAction SilentlyContinue | Out-Null } elseif (Test-Path -LiteralPath $fallbackExe) { Start-Process -FilePath $fallbackExe -ArgumentList '--tray','--relaunched' -WorkingDirectory $currentAppDir -ErrorAction SilentlyContinue | Out-Null }"
-                        if self._restart_in_tray
-                        else "    if (Test-Path -LiteralPath $exePath) { Start-Process -FilePath $exePath -ArgumentList '--relaunched' -WorkingDirectory $appDir -ErrorAction SilentlyContinue | Out-Null } elseif (Test-Path -LiteralPath $fallbackExe) { Start-Process -FilePath $fallbackExe -ArgumentList '--relaunched' -WorkingDirectory $currentAppDir -ErrorAction SilentlyContinue | Out-Null }"
-                    ),
+                    "    if (Test-Path -LiteralPath $exePath) { Start-Process -FilePath $exePath -ArgumentList '--relaunched' -WorkingDirectory $appDir -ErrorAction SilentlyContinue | Out-Null } elseif (Test-Path -LiteralPath $fallbackExe) { Start-Process -FilePath $fallbackExe -ArgumentList '--relaunched' -WorkingDirectory $currentAppDir -ErrorAction SilentlyContinue | Out-Null }",
                     "    New-Item -ItemType Directory -Path $logDir -Force | Out-Null",
                     "    ($_ | Out-String) | Set-Content -LiteralPath $errorLog -Encoding UTF8",
                     "    throw",

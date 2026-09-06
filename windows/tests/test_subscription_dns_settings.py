@@ -23,6 +23,11 @@ def test_subscription_and_dns_settings_round_trip() -> None:
         subscription_use_proxy_tun=True,
         subscription_converter_enabled=True,
         subscription_converter_url="https://converter.test/sub?url={url}",
+        node_sort_key="speed",
+        node_sort_ascending=False,
+        node_filter_group="Work",
+        selected_subscription_id="subscription-1",
+        node_table_layout={"manual": True, "name": 360.0, "ping": 120.0},
     )
     routing = RoutingSettings(
         dns_bootstrap_servers=["1.1.1.1", "8.8.8.8"],
@@ -41,6 +46,15 @@ def test_subscription_and_dns_settings_round_trip() -> None:
     assert restored_settings.subscription_hwid == "device-id-for-panel"
     assert restored_settings.subscription_use_proxy_tun is True
     assert restored_settings.subscription_converter_enabled is True
+    assert restored_settings.node_sort_key == "speed"
+    assert restored_settings.node_sort_ascending is False
+    assert restored_settings.node_filter_group == "Work"
+    assert restored_settings.selected_subscription_id == "subscription-1"
+    assert restored_settings.node_table_layout == {
+        "manual": True,
+        "name": 360.0,
+        "ping": 120.0,
+    }
     assert restored_routing.dns_bootstrap_servers == ["1.1.1.1", "8.8.8.8"]
     assert restored_routing.dns_proxy_server == "dns.google"
     assert restored_routing.dns_parallel_query is True

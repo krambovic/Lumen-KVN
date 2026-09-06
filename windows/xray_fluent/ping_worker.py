@@ -5,6 +5,7 @@ import socket
 import os
 import threading
 import time
+from urllib.request import Request, urlopen
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -29,6 +30,71 @@ def tcp_ping(host: str, port: int, timeout: float = 2.0) -> int | None:
             return int(elapsed)
     except OSError:
         return None
+
+
+def udp_ping(host: str, port: int, timeout: float = 2.0) -> int | None:
+    """Measure a UDP endpoint without assuming a TCP listener.
+
+    Hysteria/Hysteria2 use QUIC over UDP.  A tiny datagram is enough to make
+    the OS perform the endpoint reachability check; when the peer answers (or
+    reports an ICMP error) we return the elapsed time.  Some servers silently
+    drop unknown datagrams, in which case the caller can use ICMP as fallback.
+    """
+    if not host or not port:
+        return None
+    start = time.perf_counter()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect((host, port))
+            sock.send(b"\x00")
+            try:
+                sock.recv(1)
+            except socket.timeout:
+                return None
+        return int((time.perf_counter() - start) * 1000.0)
+    except OSError:
+        return None
+
+
+def hysteria_ping(host: str, port: int, timeout: float = 2.0) -> int | None:
+    """Ping a Hysteria endpoint using its UDP transport.
+
+    UDP probes are intentionally followed by ICMP: Hysteria servers commonly
+    ignore non-QUIC datagrams, while ICMP still provides a useful endpoint
+    latency measurement without starting sing-box or a proxy session.
+    """
+    measured = udp_ping(host, port, timeout)
+    if measured is not None:
+        return measured
+    return icmp_ping(host, int(timeout * 1000))
+
+
+def http_get_ping(host: str, port: int, timeout: float = 3.0) -> int | None:
+    """Measure an endpoint with a direct HTTP(S) GET, without a proxy core."""
+    if not host or not port:
+        return None
+    for scheme in ("https", "http"):
+        started = time.perf_counter()
+        try:
+            request = Request(f"{scheme}://{host}:{int(port)}/", method="GET")
+            with urlopen(request, timeout=timeout) as response:
+                response.read(1)
+            return int((time.perf_counter() - started) * 1000.0)
+        except Exception:
+            continue
+    return None
+
+
+def endpoint_ping(host: str, port: int, protocol: str, method: str, timeout: float) -> int | None:
+    """Best-effort transport ping for protocols without an Xray test adapter."""
+    if method == "icmp":
+        return icmp_ping(host, int(timeout * 1000))
+    if method == "http":
+        return http_get_ping(host, port, timeout) or icmp_ping(host, int(timeout * 1000))
+    if protocol in {"hysteria", "hysteria2", "hy", "hy2", "tuic", "awg", "wireguard", "warp", "masque"}:
+        return hysteria_ping(host, port, timeout)
+    return tcp_ping(host, port, timeout)
 
 
 def icmp_ping(host: str, timeout_ms: int = ICMP_PING_TIMEOUT_MS) -> int | None:
@@ -346,7 +412,7 @@ class PingWorker(QThread):
         self._nodes = nodes
         self._timeout = timeout
         self._bypass_tun = bypass_tun
-        self._method = method if method in ("tcping", "icmp") else "tcping"
+        self._method = method if method in ("tcping", "icmp", "http", "real") else "tcping"
         self._cancelled = False
 
     def _measure(self, node: Node) -> int | None:
@@ -358,6 +424,17 @@ class PingWorker(QThread):
                 target = direct
         if self._method == "icmp":
             return icmp_ping(target, int(self._timeout * 1000))
+        outbound = node.outbound if isinstance(node.outbound, dict) else {}
+        protocol = str(
+            outbound.get("protocol")
+            or outbound.get("type")
+            or node.scheme
+            or ""
+        ).strip().lower()
+        if protocol in {"hysteria", "hysteria2", "hy", "hy2"}:
+            return hysteria_ping(target, node.port, self._timeout)
+        if self._method in {"http", "real"}:
+            return endpoint_ping(target, node.port, protocol, self._method, self._timeout)
         return tcp_ping(target, node.port, self._timeout)
 
     def cancel(self) -> None:

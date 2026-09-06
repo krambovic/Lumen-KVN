@@ -7,7 +7,7 @@ from .data_paths import resolve_data_dir, seed_user_data
 
 
 APP_NAME = "Lumen"
-APP_VERSION = "1.9.10"
+APP_VERSION = "1.9.11"
 STATE_SCHEMA_VERSION = 1
 # Bump when parsing/reconciliation semantics change; cached validators remain
 # useful, while the value lets future migrations force one clean reconcile.
@@ -64,8 +64,8 @@ SINGBOX_PATH_DEFAULT = BASE_DIR / "core" / "sing-box.exe"
 SINGBOX_CLASH_API_PORT = 19090
 SINGBOX_CLASH_API_SELECTOR = "proxy"
 SINGBOX_XRAY_RELAY_PORT = 11808
-SINGBOX_TUN_INTERFACE_NAME = "tun0"
-SINGBOX_LEGACY_TUN_INTERFACE_NAMES = ("singbox_tun", "xftun*")
+SINGBOX_TUN_INTERFACE_NAME = "singbox_tun"
+SINGBOX_LEGACY_TUN_INTERFACE_NAMES = ("tun0", "xftun*")
 
 SPEED_TEST_DEFAULT_URL = "https://cachefly.cachefly.net/50mb.test"
 SPEED_TEST_PING_URL = "https://www.google.com/generate_204"

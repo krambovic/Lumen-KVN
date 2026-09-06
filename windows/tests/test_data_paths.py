@@ -88,6 +88,35 @@ def test_seed_user_data_keeps_checkout_state_when_user_profile_exists(tmp_path: 
     assert (target / "state.enc").read_bytes() == b"user-state"
 
 
+def test_seed_user_data_updates_only_pristine_legacy_singbox_default(tmp_path: Path) -> None:
+    source = tmp_path / "checkout" / "data"
+    target = tmp_path / "LocalAppData" / "Lumen" / "data"
+    source_template = source / "templates" / "sing-box" / "default.json"
+    target_template = target / "templates" / "sing-box" / "default.json"
+    source_template.parent.mkdir(parents=True)
+    target_template.parent.mkdir(parents=True)
+    source_template.write_text(
+        '{"inbounds":[{"type":"tun","interface_name":"singbox_tun"}],"route":{}}',
+        encoding="utf-8",
+    )
+    target_template.write_text(
+        '{"inbounds":[{"type":"tun","interface_name":"tun0"}],"route":{}}',
+        encoding="utf-8",
+    )
+
+    data_paths.seed_user_data(source, target)
+
+    assert '"interface_name":"singbox_tun"' in target_template.read_text(encoding="utf-8")
+
+    target_template.write_text(
+        '{"inbounds":[{"type":"tun","interface_name":"custom_tun"}],"route":{}}',
+        encoding="utf-8",
+    )
+    data_paths.seed_user_data(source, target)
+
+    assert '"interface_name":"custom_tun"' in target_template.read_text(encoding="utf-8")
+
+
 def test_failed_legacy_cleanup_is_retried_without_overwriting_new_state(tmp_path: Path, monkeypatch) -> None:
     legacy = tmp_path / "Lumen KVN" / "data"
     legacy.mkdir(parents=True)

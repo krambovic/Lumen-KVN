@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import filecmp
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -276,6 +277,7 @@ def seed_user_data(src: Path, dst: Path) -> None:
                 shutil.copytree(source, target)
             except Exception:
                 pass
+    _refresh_pristine_singbox_default(src, dst)
     for name in ("state.enc", "traffic_history.json"):
         source = src / name
         target = dst / name
@@ -286,6 +288,35 @@ def seed_user_data(src: Path, dst: Path) -> None:
                 shutil.copy2(source, target)
             except Exception:
                 continue
+
+
+def _refresh_pristine_singbox_default(src: Path, dst: Path) -> None:
+    """Upgrade the old packaged TUN name without overwriting user edits."""
+    source = src / "templates" / "sing-box" / "default.json"
+    target = dst / "templates" / "sing-box" / "default.json"
+    if not source.is_file() or not target.is_file():
+        return
+    try:
+        source_payload = json.loads(source.read_text(encoding="utf-8"))
+        legacy_payload = json.loads(source.read_text(encoding="utf-8"))
+        target_payload = json.loads(target.read_text(encoding="utf-8"))
+        source_tun = next(
+            item
+            for item in source_payload.get("inbounds", [])
+            if isinstance(item, dict) and str(item.get("type") or "").lower() == "tun"
+        )
+        legacy_tun = next(
+            item
+            for item in legacy_payload.get("inbounds", [])
+            if isinstance(item, dict) and str(item.get("type") or "").lower() == "tun"
+        )
+        if source_tun.get("interface_name") != "singbox_tun":
+            return
+        legacy_tun["interface_name"] = "tun0"
+        if target_payload == legacy_payload:
+            shutil.copy2(source, target)
+    except (OSError, ValueError, StopIteration, TypeError):
+        return
 
 
 

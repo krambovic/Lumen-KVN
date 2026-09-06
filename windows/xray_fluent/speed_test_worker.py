@@ -32,7 +32,7 @@ from .constants import (
 )
 from .http_utils import build_opener
 from .models import Node, RoutingSettings
-from .ping_worker import _WindowsPingBypass
+from .ping_worker import _WindowsPingBypass, endpoint_ping
 from .xray_fragments import apply_xray_final_fragment
 
 
@@ -134,7 +134,8 @@ class SpeedTestWorker(QThread):
         total = len(self._nodes)
         self._completed_nodes = 0
         try:
-            if not Path(self._xray_path).is_file():
+            needs_core = any(not self._uses_direct_ping_fallback(node) for node in self._nodes)
+            if needs_core and not Path(self._xray_path).is_file():
                 for node in self._nodes:
                     if self._cancelled:
                         break
@@ -219,6 +220,18 @@ class SpeedTestWorker(QThread):
         return targets
 
     def _test_node(self, node: Node) -> tuple[Node, float | None, bool]:
+        if self._mode == "ping" and self._uses_direct_ping_fallback(node):
+            protocol = self._node_protocol(node)
+            target = node.server
+            bypass = getattr(self, "_bypass", None)
+            if bypass is not None:
+                direct = bypass.direct_ip(node.server)
+                if direct:
+                    target = direct
+            method = "http" if protocol not in {"hysteria", "hysteria2", "hy", "hy2"} else "real"
+            delay = endpoint_ping(target, node.port, protocol, method, self._timeout)
+            return node, float(delay or 0), delay is not None
+
         reservation: socket.socket | None = None
         tmp = None
         proc = None
@@ -267,6 +280,7 @@ class SpeedTestWorker(QThread):
 
         except Exception:
             return node, None, False
+
         finally:
             if reservation is not None:
                 self._close_reserved_ports([reservation])
@@ -283,6 +297,19 @@ class SpeedTestWorker(QThread):
                     Path(tmp.name).unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    @staticmethod
+    def _node_protocol(node: Node) -> str:
+        outbound = node.outbound if isinstance(node.outbound, dict) else {}
+        return str(outbound.get("protocol") or outbound.get("type") or node.scheme or "").strip().lower()
+
+    @classmethod
+    def _uses_direct_ping_fallback(cls, node: Node) -> bool:
+        return cls._node_protocol(node) in {
+            "awg", "wireguard", "warp", "hysteria", "hysteria2", "hy", "hy2",
+            "tuic", "masque", "openvpn", "mieru", "naive", "anytls", "snell",
+            "singbox_config",
+        }
 
     def _apply_direct_ip_to_outbound(self, outbound: dict, host: str) -> None:
         # While TUN is up, point the temp xray outbound at the server's real

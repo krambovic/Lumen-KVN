@@ -138,7 +138,7 @@ def _auto_candidate_supports(candidate: dict, test: str, *, ping_method: str) ->
     server, port = _outbound_endpoint(candidate)
     if not server or port <= 0:
         return False
-    if test == "speed" or ping_method in {"http", "real"}:
+    if test == "speed":
         return protocol not in _XRAY_TEST_UNSUPPORTED and protocol not in {
             "awg", "hysteria", "hysteria2", "hy", "hy2", "masque", "mieru",
             "openvpn", "naive", "tuic", "warp", "wireguard",
@@ -155,14 +155,21 @@ def _node_supports_test(node: Node, test: str, *, ping_method: str = "tcping") -
             _auto_candidate_supports(candidate, test, ping_method=ping_method)
             for candidate in _auto_candidate_outbounds(node)
         )
-    if test == "speed" or ping_method in {"http", "real"}:
+    if test == "speed":
         return not is_native_singbox_only_node(node) and protocol not in _XRAY_TEST_UNSUPPORTED
-    return protocol not in _ENDPOINT_PING_UNSUPPORTED
+    if protocol in _ENDPOINT_PING_UNSUPPORTED:
+        server, port = _outbound_endpoint(node.outbound if isinstance(node.outbound, dict) else {})
+        if not server:
+            server = str(node.server or "").strip()
+        if port <= 0:
+            port = _port_number(node.port)
+        return bool(server and port > 0)
+    return bool(node.server and _port_number(node.port) > 0)
 
 
 def _node_for_test(node: Node, test: str, *, ping_method: str) -> Node:
     protocol = _node_protocol(node)
-    if protocol not in _AUTO_CONFIG_PROTOCOLS or test == "speed" or ping_method in {"http", "real"}:
+    if protocol not in _AUTO_CONFIG_PROTOCOLS or test == "speed":
         return node
     for candidate in _auto_candidate_outbounds(node):
         if not _auto_candidate_supports(candidate, test, ping_method=ping_method):
@@ -171,6 +178,10 @@ def _node_for_test(node: Node, test: str, *, ping_method: str) -> Node:
         prepared = deepcopy(node)
         prepared.server = server
         prepared.port = port
+        candidate_protocol = _outbound_protocol(candidate)
+        if candidate_protocol:
+            prepared.scheme = candidate_protocol
+            prepared.outbound = {"protocol": candidate_protocol, "singbox": deepcopy(candidate)}
         return prepared
     return node
 
@@ -275,9 +286,10 @@ def ping_nodes(
 
     xray_test_executable = None
     if resolved_method in {"http", "real"}:
-        xray_test_executable = _resolve_xray_test_executable(controller)
-        if xray_test_executable is None:
-            return
+        if any(not SpeedTestWorker._uses_direct_ping_fallback(node) for node in nodes):
+            xray_test_executable = _resolve_xray_test_executable(controller)
+            if xray_test_executable is None:
+                return
 
     if controller._ping_worker and controller._ping_worker.isRunning():
         previous = controller._ping_worker

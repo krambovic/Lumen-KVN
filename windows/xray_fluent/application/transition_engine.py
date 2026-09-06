@@ -74,7 +74,12 @@ def can_apply_proxy_runtime_change(
     proxy_enabled: bool,
     proxy_bypass_lan: bool,
 ) -> bool:
-    if session.active_core != "xray" or session.tun_mode or settings_tun_mode:
+    if (
+        session.active_core not in {"xray", "singbox"}
+        or getattr(session, "hybrid", False)
+        or session.tun_mode
+        or settings_tun_mode
+    ):
         return False
     if session.xray_layer_signature != current_xray_layer_signature:
         return False
@@ -103,8 +108,15 @@ def can_tun_hot_swap(
     has_selected_node: bool,
     current_tun_layer_signature: str,
 ) -> bool:
-    if not settings_tun_mode or not session.tun_mode or not has_selected_node:
+    # Native sing-box exposes the same selector control plane in both TUN and
+    # system-proxy mode. Keep the existing name for transition compatibility,
+    # but require the current mode to remain unchanged.
+    if settings_tun_mode != session.tun_mode or not has_selected_node:
         return False
-    if session.active_core != "singbox" or not session.clash_api_selector:
+    if (
+        session.active_core != "singbox"
+        or getattr(session, "hybrid", False)
+        or not session.clash_api_selector
+    ):
         return False
     return session.tun_layer_signature == current_tun_layer_signature

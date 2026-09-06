@@ -25,9 +25,9 @@ Item {
 
     // ── filtering / sorting state ───────────────────
     property string filterText: ""
-    property string filterGroup: ""   // "" = all groups
-    property string sortKey: "manual"
-    property bool sortAsc: true
+    property string filterGroup: App.nodeFilterGroup   // "" = all groups
+    property string sortKey: App.nodeSortKey
+    property bool sortAsc: App.nodeSortAscending
 
     readonly property var groupModel: [I18n.t("Все группы")].concat(App.groupOptions)
     readonly property var sortLabels: [I18n.t("Вручную"), I18n.t("Имя"), I18n.t("Группа"), I18n.t("Тип"), I18n.t("Транспорт"), I18n.t("Пинг"), I18n.t("Скорость"), I18n.t("Последнее использование")]
@@ -41,17 +41,18 @@ Item {
 
     // Columns start in automatic mode. The first divider drag freezes the
     // current layout, after which every boundary can be adjusted independently.
-    property bool manualColumnWidths: false
-    property real manualColName: 160
-    property real manualColType: 78
-    property real manualColTransport: 92
-    property real manualColAddr: 150
-    property real manualColPort: 60
-    property real manualColGroup: 120
-    property real manualColPing: 80
-    property real manualColSpeed: 108
-    property real manualColStatus: 72
-    property real manualColLast: 140
+    readonly property var savedTableLayout: App.nodeTableLayout || ({})
+    property bool manualColumnWidths: savedTableLayout.manual === true
+    property real manualColName: savedTableLayout.name !== undefined ? Number(savedTableLayout.name) : 160
+    property real manualColType: savedTableLayout.type !== undefined ? Number(savedTableLayout.type) : 78
+    property real manualColTransport: savedTableLayout.transport !== undefined ? Number(savedTableLayout.transport) : 92
+    property real manualColAddr: savedTableLayout.address !== undefined ? Number(savedTableLayout.address) : 150
+    property real manualColPort: savedTableLayout.port !== undefined ? Number(savedTableLayout.port) : 60
+    property real manualColGroup: savedTableLayout.group !== undefined ? Number(savedTableLayout.group) : 120
+    property real manualColPing: savedTableLayout.ping !== undefined ? Number(savedTableLayout.ping) : 80
+    property real manualColSpeed: savedTableLayout.speed !== undefined ? Number(savedTableLayout.speed) : 108
+    property real manualColStatus: savedTableLayout.status !== undefined ? Number(savedTableLayout.status) : 72
+    property real manualColLast: savedTableLayout.last !== undefined ? Number(savedTableLayout.last) : 140
 
     readonly property int colType: Math.round(manualColType)
     readonly property int colTransport: Math.round(manualColTransport)
@@ -111,6 +112,23 @@ Item {
         else if (index === 7) manualColSpeed = value;
         else if (index === 8) manualColStatus = value;
         else if (index === 9) manualColLast = value;
+        persistTableLayout();
+    }
+
+    function persistTableLayout() {
+        App.setNodeTableLayout({
+            "manual": manualColumnWidths,
+            "name": manualColName,
+            "type": manualColType,
+            "transport": manualColTransport,
+            "address": manualColAddr,
+            "port": manualColPort,
+            "group": manualColGroup,
+            "ping": manualColPing,
+            "speed": manualColSpeed,
+            "status": manualColStatus,
+            "last": manualColLast
+        });
     }
 
     // ── selection helpers ─────────────────────
@@ -362,12 +380,48 @@ Item {
                 var group = String(subs[i].group || subs[i].name || "Default");
                 if (group === groupName) {
                     subCombo.currentIndex = i + 1;
+                    App.setSelectedSubscriptionId(String(subs[i].id || ""));
                     return;
                 }
             }
             subCombo.currentIndex = 0;
+            App.setSelectedSubscriptionId("");
         });
     }
+
+    function restoreSubscriptionSelection() {
+        var wanted = String(App.selectedSubscriptionId || "");
+        var subs = App.subscriptions || [];
+        for (var i = 0; i < subs.length; i++) {
+            if (String(subs[i].id || "") === wanted) {
+                subCombo.currentIndex = i + 1;
+                return;
+            }
+        }
+        subCombo.currentIndex = 0;
+        if (wanted.length)
+            App.setSelectedSubscriptionId("");
+    }
+
+    function restoreServerViewState() {
+        var groupIndex = page.groupModel.indexOf(page.filterGroup);
+        if (groupIndex < 0) {
+            page.filterGroup = "";
+            groupIndex = 0;
+        }
+        groupCombo.currentIndex = groupIndex;
+        var sortIndex = page.sortKeys.indexOf(page.sortKey);
+        if (sortIndex < 0) {
+            page.sortKey = "manual";
+            sortIndex = 0;
+        }
+        sortCombo.currentIndex = sortIndex;
+        page.applyFilters();
+        App.setNodeSort(page.sortKey, page.sortAsc);
+        page.restoreSubscriptionSelection();
+    }
+
+    Component.onCompleted: Qt.callLater(page.restoreServerViewState)
 
     function applySort(key) {
         if (!key) return;
@@ -789,6 +843,11 @@ Item {
                         model: [I18n.t("Нет подписки")].concat(
                             App.subscriptions.map(function(s) { return (s.name && s.name.length ? s.name : s.url) + " (" + (s.node_count || 0) + ")"; })
                         )
+                        onActivated: {
+                            var subs = App.subscriptions || [];
+                            var i = currentIndex - 1;
+                            App.setSelectedSubscriptionId(i >= 0 && i < subs.length ? String(subs[i].id || "") : "");
+                        }
                     }
                     AccentButton { kind: "ghost"; iconOnly: true; glyph: "\uE72C"; text: I18n.t("Обновить подписку"); enabled: page.selectedSub() !== null; onClicked: { var s = page.selectedSub(); if (s) App.updateSubscription(s.url) } }
                     AccentButton { kind: "ghost"; iconOnly: true; glyph: "\uE895"; text: I18n.t("Обновить все подписки"); enabled: App.subscriptions.length > 0; onClicked: App.updateAllSubscriptions() }
@@ -1943,6 +2002,9 @@ Item {
         function onSubscriptionImported(groupName) {
             page.selectGroupByName(groupName);
             page.selectSubscriptionByGroup(groupName);
+        }
+        function onSubscriptionsChanged() {
+            Qt.callLater(page.restoreSubscriptionSelection);
         }
         function onNodeQrReady(dataUri, name) {
             qrDialog.qrSource = dataUri;

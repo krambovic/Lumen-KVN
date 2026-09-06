@@ -240,7 +240,7 @@ def test_tun_runtime_uses_stable_low_mtu_v2rayn_defaults(monkeypatch: pytest.Mon
     )
     inbound = _tun_inbound(config)
 
-    assert inbound["interface_name"] == "tun0"
+    assert inbound["interface_name"] == "xftun"
     assert inbound["address"] == ["172.18.0.1/30", "fdfe:dcba:9876::1/126"]
     assert inbound["mtu"] == 1280
     assert inbound["stack"] == "gvisor"
@@ -254,6 +254,20 @@ def test_tun_runtime_uses_stable_low_mtu_v2rayn_defaults(monkeypatch: pytest.Mon
         and rule.get("action") == "reject"
         for rule in config["route"]["rules"]
     )
+
+
+def test_tun_runtime_uses_singbox_tun_when_interface_name_is_missing() -> None:
+    payload = _base_config()
+    payload["inbounds"][0].pop("interface_name")
+    document = parse_singbox_document(Path("test.json"), json.dumps(payload))
+
+    config = plan_singbox_runtime(
+        document,
+        _node(),
+        routing=RoutingSettings(mode="global", tun_default_outbound="proxy"),
+    ).singbox_config
+
+    assert _tun_inbound(config)["interface_name"] == "singbox_tun"
 
 
 def test_tun_runtime_keeps_v2rayn_style_local_proxy_inbounds() -> None:
@@ -396,17 +410,33 @@ def test_tun_runtime_rejects_browser_doh_dns_before_fakeip() -> None:
     assert https_index < doh_index < fake_index
 
 
-def test_vmess_xhttp_uses_xray_sidecar_but_vless_xhttp_stays_native() -> None:
-    assert classify_node_for_singbox(_xhttp_node("vmess")) == "hybrid_xray_sidecar"
+def test_vmess_xhttp_uses_native_singbox_and_vless_xhttp_stays_native() -> None:
+    assert classify_node_for_singbox(_xhttp_node("vmess")) == "native_singbox"
     assert classify_node_for_singbox(_xhttp_node("vless")) == "native_singbox"
 
 
-def test_vmess_xhttp_hybrid_plan_preserves_original_xray_outbound() -> None:
+def test_vless_raw_without_finalmask_uses_native_singbox() -> None:
+    node = _node()
+    node.outbound["streamSettings"]["network"] = "raw"
+
+    assert classify_node_for_singbox(node) == "native_singbox"
+    outbound = build_singbox_outbound(node, tag="proxy")
+    assert "transport" not in outbound
+
+
+def test_vless_raw_with_finalmask_keeps_xray_sidecar() -> None:
+    node = _node()
+    node.outbound["streamSettings"].update(
+        {
+            "network": "raw",
+            "finalmask": {"tcp": [{"type": "fragment", "settings": {}}]},
+        }
+    )
     text = json.dumps(_base_config())
     document = parse_singbox_document(Path("test.json"), text)
     plan = plan_singbox_runtime(
         document,
-        _xhttp_node("vmess"),
+        node,
         routing=RoutingSettings(mode="global", tun_default_outbound="proxy"),
         enable_final_fragment=False,
     )
@@ -416,8 +446,9 @@ def test_vmess_xhttp_hybrid_plan_preserves_original_xray_outbound() -> None:
     proxy = next(outbound for outbound in plan.singbox_config["outbounds"] if outbound.get("tag") == "proxy")
     xray_proxy = next(outbound for outbound in plan.xray_sidecar.config["outbounds"] if outbound.get("tag") == "proxy")
     assert proxy["type"] == "socks"
-    assert xray_proxy["protocol"] == "vmess"
-    assert xray_proxy["streamSettings"]["network"] == "xhttp"
+    assert xray_proxy["protocol"] == "vless"
+    assert xray_proxy["streamSettings"]["network"] == "raw"
+    assert "finalmask" in xray_proxy["streamSettings"]
 
 
 def test_system_dns_mode_uses_physical_adapter_dns_without_local_recursion() -> None:
@@ -1164,14 +1195,14 @@ def test_planner_runtime_error_is_reported_as_a_connection_error() -> None:
     assert statuses == [("error", "Не найден региональный rule-set geosite:ru-blocked.")]
 
 
-def test_hot_switch_selector_contains_native_nodes_and_skips_hybrid_nodes() -> None:
+def test_hot_switch_selector_contains_all_native_extended_nodes() -> None:
     first = _node_with_server("first.example.com")
     first.id = "first-node"
     second = _node_with_server("second.example.com")
     second.id = "second-node"
-    hybrid = Node(
-        id="hybrid-node",
-        name="Hybrid",
+    extended = Node(
+        id="extended-node",
+        name="Extended",
         scheme="vmess",
         server="hybrid.example.com",
         port=443,
@@ -1188,17 +1219,18 @@ def test_hot_switch_selector_contains_native_nodes_and_skips_hybrid_nodes() -> N
         first,
         routing=RoutingSettings(mode="global", tun_default_outbound="proxy"),
         enable_hot_switch=True,
-        hot_switch_nodes=(first, second, hybrid),
+        hot_switch_nodes=(first, second, extended),
     )
 
     assert plan.clash_api_selector == "proxy"
     selector = next(item for item in plan.singbox_config["outbounds"] if item.get("tag") == "proxy")
     assert selector["type"] == "selector"
     assert selector["default"] in selector["outbounds"]
-    assert len(selector["outbounds"]) == 2
-    assert singbox_node_tag(hybrid.id) not in selector["outbounds"]
+    assert len(selector["outbounds"]) == 3
+    assert singbox_node_tag(extended.id) in selector["outbounds"]
     assert dict(plan.clash_api_node_signatures) == {
         first.id: singbox_node_source_signature(first),
         second.id: singbox_node_source_signature(second),
+        extended.id: singbox_node_source_signature(extended),
     }
     assert not any(item.get("tag") == "proxy" and item.get("type") != "selector" for item in plan.singbox_config["outbounds"])

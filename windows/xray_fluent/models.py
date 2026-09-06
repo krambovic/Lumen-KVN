@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import locale
+import math
 from typing import Any
 import uuid
 
@@ -420,6 +421,13 @@ class AppSettings:
     proxy_auth_username: str = ""
     proxy_auth_password: str = ""
     sniff_route_only: bool = False
+    # Servers page UI state. Keep view choices across page recreation and app
+    # restarts without mixing them into subscription/node data.
+    node_sort_key: str = "manual"
+    node_sort_ascending: bool = True
+    node_filter_group: str = ""
+    selected_subscription_id: str = ""
+    node_table_layout: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         from .routing_presets import normalize_regional_preset
@@ -436,6 +444,13 @@ class AppSettings:
             self.proxy_auth_username and self.proxy_auth_password
         ):
             self.proxy_auth_enabled = False
+        if self.node_sort_key not in {
+            "manual", "name", "group", "scheme", "transport", "ping", "speed", "last"
+        }:
+            self.node_sort_key = "manual"
+        self.node_filter_group = str(self.node_filter_group or "").strip()
+        self.selected_subscription_id = str(self.selected_subscription_id or "").strip()
+        self.node_table_layout = _normalize_node_table_layout(self.node_table_layout)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -490,6 +505,11 @@ class AppSettings:
             "proxy_auth_username": self.proxy_auth_username,
             "proxy_auth_password": self.proxy_auth_password,
             "sniff_route_only": self.sniff_route_only,
+            "node_sort_key": self.node_sort_key,
+            "node_sort_ascending": self.node_sort_ascending,
+            "node_filter_group": self.node_filter_group,
+            "selected_subscription_id": self.selected_subscription_id,
+            "node_table_layout": dict(self.node_table_layout),
             "xray_config_file": self.xray_config_file,
             "xray_template_file": self.xray_template_file,
             "singbox_path": self.singbox_path,
@@ -596,6 +616,15 @@ class AppSettings:
             proxy_auth_username=str(data.get("proxy_auth_username") or ""),
             proxy_auth_password=str(data.get("proxy_auth_password") or ""),
             sniff_route_only=bool(data.get("sniff_route_only", False)),
+            node_sort_key=str(data.get("node_sort_key") or "manual"),
+            node_sort_ascending=bool(data.get("node_sort_ascending", True)),
+            node_filter_group=str(data.get("node_filter_group") or ""),
+            selected_subscription_id=str(data.get("selected_subscription_id") or ""),
+            node_table_layout=(
+                dict(data.get("node_table_layout"))
+                if isinstance(data.get("node_table_layout"), dict)
+                else {}
+            ),
             xray_config_file=str(data.get("xray_config_file") or ""),
             xray_template_file=str(data.get("xray_template_file") or ""),
             singbox_path=str(data.get("singbox_path") or ""),
@@ -718,6 +747,31 @@ class AppState:
 def _normalize_tun_stack(value: Any) -> str:
     stack = str(value or "").strip().lower()
     return stack if stack in {"system", "gvisor", "mixed"} else "mixed"
+
+
+def _normalize_node_table_layout(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    allowed = {
+        "manual", "name", "type", "transport", "address", "port",
+        "group", "ping", "speed", "status", "last",
+    }
+    normalized: dict[str, Any] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key)
+        if key not in allowed:
+            continue
+        if key == "manual":
+            normalized[key] = bool(raw_value)
+            continue
+        try:
+            numeric = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(numeric):
+            continue
+        normalized[key] = max(48.0, min(numeric, 2000.0))
+    return normalized
 
 
 def _clamp_tun_mtu(value: Any) -> int:

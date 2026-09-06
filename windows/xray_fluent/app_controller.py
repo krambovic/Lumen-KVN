@@ -1163,7 +1163,7 @@ class AppController(QObject):
             preferred_protect_password=preferred_protect_password,
             system_dns_servers=system_dns_servers,
             tun_mode=tun_mode,
-            enable_hot_switch=bool(tun_mode),
+            enable_hot_switch=True,
             hot_switch_nodes=tuple(self.state.nodes),
         )
 
@@ -1312,10 +1312,11 @@ class AppController(QObject):
 
     def _apply_proxy_runtime_change(self) -> bool:
         settings = self.state.settings
+        session = self._active_session
         bypass_lan = self._system_proxy_bypass_lan()
-        if self._active_session is not None:
-            socks_port = self._active_session.socks_port
-            http_port = self._active_session.http_port
+        if session is not None:
+            socks_port = session.socks_port
+            http_port = session.http_port
         else:
             socks_port, http_port = self.get_effective_proxy_ports()
         try:
@@ -1336,18 +1337,27 @@ class AppController(QObject):
             )
             return False
 
-        node = self.selected_node
+        node = self.selected_node if session is None or session.node_id is not None else None
         if self.connected:
             self._capture_active_session(
                 node,
-                tun=False,
-                core="xray",
-                api_port=self._active_session.api_port if self._active_session else self._xray_api_port,
+                tun=bool(session.tun_mode) if session is not None else False,
+                core=session.active_core if session is not None else self._active_core,
+                api_port=session.api_port if session is not None else self._xray_api_port,
+                clash_api_secret=session.clash_api_secret if session is not None else "",
+                clash_api_selector=session.clash_api_selector if session is not None else "",
+                clash_api_node_signatures=(
+                    session.clash_api_node_signatures if session is not None else ()
+                ),
+                hybrid=bool(session.hybrid) if session is not None else False,
                 socks_port=socks_port,
                 http_port=http_port,
-                xray_inbound_tags=self._active_session.xray_inbound_tags if self._active_session else (),
-                ping_host=self._active_session.ping_host if self._active_session else "",
-                ping_port=self._active_session.ping_port if self._active_session else 0,
+                xray_inbound_tags=session.xray_inbound_tags if session is not None else (),
+                sidecar_relay_port=session.sidecar_relay_port if session is not None else 0,
+                protect_ss_port=session.protect_ss_port if session is not None else 0,
+                protect_ss_password=session.protect_ss_password if session is not None else "",
+                ping_host=session.ping_host if session is not None else "",
+                ping_port=session.ping_port if session is not None else 0,
             )
         return True
 
@@ -2522,7 +2532,7 @@ class AppController(QObject):
             self._request_transition("network changed")
 
     def _hot_swap_node(self, reason: str) -> bool:
-        """Handle node switch while TUN is active."""
+        """Handle native sing-box node switch without restarting its runtime."""
         session = self._active_session
         if session is None:
             self._auto_switch_transitioning = False

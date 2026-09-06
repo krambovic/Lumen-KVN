@@ -170,7 +170,15 @@ def test_hot_switch_skips_a_node_whose_runtime_mapping_is_stale(monkeypatch) -> 
     assert calls == []
 
 
-def test_hot_switch_updates_the_active_session_without_restart(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("tun_mode", "mode_label"),
+    [(True, "TUN"), (False, "прокси")],
+)
+def test_hot_switch_updates_the_active_session_without_restart(
+    monkeypatch,
+    tun_mode: bool,
+    mode_label: str,
+) -> None:
     node = Node(id="new-node", name="New", server="new.example.com", port=443)
     mapping = ((node.id, singbox_node_source_signature(node)),)
     captured: dict[str, object] = {}
@@ -179,7 +187,7 @@ def test_hot_switch_updates_the_active_session_without_restart(monkeypatch) -> N
     controller = SimpleNamespace(
         _active_session=SimpleNamespace(
             active_core="singbox",
-            tun_mode=True,
+            tun_mode=tun_mode,
             hybrid=False,
             clash_api_selector="proxy",
             clash_api_secret="secret",
@@ -211,9 +219,10 @@ def test_hot_switch_updates_the_active_session_without_restart(monkeypatch) -> N
 
     assert operations.try_hot_switch_selector(controller, "node switched") is True
     assert captured["node"] is node
+    assert captured["tun"] is tun_mode
     assert captured["clash_api_selector"] == "proxy"
     assert captured["clash_api_node_signatures"] == mapping
-    assert statuses == [("running", "Переключено: New (TUN)")]
+    assert statuses == [("running", f"Переключено: New ({mode_label})")]
     assert metrics == [False, True]
 
 

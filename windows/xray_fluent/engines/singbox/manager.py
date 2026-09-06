@@ -189,8 +189,8 @@ class SingBoxManager(QObject):
             self._running = False
             self.state_changed.emit(False)
 
-        # Kill only orphaned processes before start. The stable tun0
-        # adapter is reused by Wintun; retry cleanup handles real conflicts.
+        # Kill only orphaned processes before start. The stable TUN adapter is
+        # reused by Wintun; retry cleanup handles real conflicts.
         self._kill_orphaned(exe)
 
         # A freshly killed sing-box can still hold the clash-api port; wait for it.

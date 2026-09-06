@@ -295,7 +295,13 @@ def _canonical_frozen_executable() -> Path:
 
 
 def _admin_launch_command(extra_args: list[str] | None = None) -> tuple[Path, str, Path]:
-    args = [arg for arg in sys.argv[1:] if arg != "--relaunch-as-admin"]
+    # `--tray` describes an OS autostart, not the user's current visibility.
+    # Carrying it into an elevation relaunch made the new window disappear.
+    args = [
+        arg
+        for arg in sys.argv[1:]
+        if arg not in {"--tray", "--relaunch-as-admin", "--relaunched"}
+    ]
     if extra_args:
         args.extend(extra_args)
     args.append("--relaunch-as-admin")

@@ -17,6 +17,7 @@ from ...application.runtime_security import (
     generate_local_proxy_credentials,
     strip_singbox_proxy_inbounds,
 )
+from ...application.node_runtime_service import is_xray_exclusive_node
 from ...constants import (
     DATA_DIR,
     DEFAULT_DISCORD_SOCKS_PORT,
@@ -36,7 +37,12 @@ from ...routing_runtime import apply_singbox_gui_routing
 from ...xray_fragments import apply_xray_final_fragment
 from ...wireguard_normalization import normalize_singbox_wireguard_endpoints
 from ...openvpn_normalization import normalize_openvpn_outbound
-from .config_builder import build_singbox_outbound
+from .config_builder import (
+    _normalize_vless_vision,
+    _preserve_or_reject_semantic_fields,
+    _strip_removed_transport_fields,
+    build_singbox_outbound,
+)
 
 
 _SS_PROTECT_METHOD = "chacha20-ietf-poly1305"
@@ -208,6 +214,9 @@ def plan_singbox_runtime(
 ) -> SingboxRuntimePlan:
     if _node_is_full_singbox_config(node):
         runtime_config = deepcopy((node.outbound or {}).get("singbox_config") or {})
+        _preserve_or_reject_semantic_fields(runtime_config)
+        _strip_removed_transport_fields(runtime_config)
+        _normalize_vless_vision(runtime_config)
         normalize_singbox_wireguard_endpoints(runtime_config)
         # Keep legacy AWG 1.5 imports readable on disk, but never pass their
         # removed members to the strict extended 2.6.x decoder.  Full imported
@@ -262,6 +271,9 @@ def plan_singbox_runtime(
         )
 
     runtime_config = deepcopy(document.payload)
+    _preserve_or_reject_semantic_fields(runtime_config)
+    _strip_removed_transport_fields(runtime_config)
+    _normalize_vless_vision(runtime_config)
     normalize_singbox_wireguard_endpoints(runtime_config)
     _normalize_openvpn_outbounds(runtime_config)
     strip_singbox_proxy_inbounds(runtime_config)
@@ -366,7 +378,7 @@ def plan_singbox_runtime(
         outbounds[proxy_index] = native_proxy
     clash_api_selector = ""
     clash_api_node_signatures: tuple[tuple[str, str], ...] = ()
-    if enable_hot_switch and tun_mode:
+    if enable_hot_switch:
         clash_api_selector, clash_api_node_signatures = _ensure_singbox_hot_switch_selector(
             runtime_config,
             selected_node=node,
@@ -496,26 +508,8 @@ def _plan_hybrid_runtime(
 
 
 def _node_should_use_xray_sidecar(node: Node | None) -> bool:
-    """Return True only for transports that sing-box cannot run natively."""
-    outbound = node.outbound if node is not None else None
-    if not isinstance(outbound, dict):
-        return False
-
-    protocol = str(outbound.get("protocol") or node.scheme or "").strip().lower()
-    if protocol == "xray_config" and isinstance(outbound.get("xray_config"), dict):
-        return True
-    stream_settings = outbound.get("streamSettings")
-    if isinstance(stream_settings, dict):
-        network = str(stream_settings.get("network") or "").strip().lower()
-        # sing-box-extended accepts VMess + XHTTP configs, but its current
-        # client closes the stream before the destination TLS handshake with
-        # Xray-compatible VMess XHTTP servers. Keep working VLESS/Trojan XHTTP
-        # native and route only this combination through the Xray sidecar.
-        if protocol == "vmess" and network == "xhttp":
-            return True
-        if protocol == "vless" and (network == "raw" or "finalmask" in stream_settings):
-            return True
-    return False
+    """Return True only for transports that require the Xray sidecar."""
+    return is_xray_exclusive_node(node)
 
 
 def _node_is_full_singbox_config(node: Node | None) -> bool:
@@ -547,6 +541,16 @@ def singbox_node_source_signature(node: Node) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _node_has_eager_singbox_runtime(node: Node) -> bool:
+    """Return whether merely declaring the node can start background traffic."""
+    outbound = node.outbound if isinstance(node.outbound, dict) else {}
+    native = outbound.get("singbox") if isinstance(outbound.get("singbox"), dict) else {}
+    outbound_type = str(
+        native.get("type") or outbound.get("protocol") or node.scheme or ""
+    ).strip().lower()
+    return outbound_type in {"masque", "wireguard", "awg", "warp", "openvpn"}
+
+
 def _ensure_singbox_hot_switch_selector(
     config: dict[str, Any],
     *,
@@ -576,7 +580,11 @@ def _ensure_singbox_hot_switch_selector(
 
     native_entries: list[tuple[str, Node, dict[str, Any]]] = []
     for node in candidates:
-        if _node_is_full_singbox_config(node) or _node_should_use_xray_sidecar(node):
+        if (
+            _node_is_full_singbox_config(node)
+            or _node_should_use_xray_sidecar(node)
+            or _node_has_eager_singbox_runtime(node)
+        ):
             continue
         try:
             native = build_singbox_outbound(
@@ -1804,7 +1812,10 @@ def _ensure_singbox_tun_runtime_contract(
             if previous_tag and previous_tag != _APP_TUN_INBOUND_TAG:
                 renamed_tun_tags.add(previous_tag)
             inbound["tag"] = _APP_TUN_INBOUND_TAG
-            inbound["interface_name"] = SINGBOX_TUN_INTERFACE_NAME
+            # Preserve an explicit name from the selected template/imported
+            # config. Only omitted names receive Lumen's stable default.
+            interface_name = str(inbound.get("interface_name") or "").strip()
+            inbound["interface_name"] = interface_name or SINGBOX_TUN_INTERFACE_NAME
             inbound["address"] = _singbox_tun_addresses()
             inbound["mtu"] = mtu_value
             inbound["auto_route"] = True

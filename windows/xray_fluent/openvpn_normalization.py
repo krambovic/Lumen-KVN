@@ -91,24 +91,27 @@ def normalize_openvpn_outbound(outbound: dict[str, Any]) -> None:
     else:
         raise ValueError(f"Unsupported OpenVPN transport `{proto}`")
 
-    cipher = normalize_data_cipher(outbound.get("cipher"))
+    raw_cipher = str(outbound.get("cipher") or "").strip()
+    cipher = normalize_data_cipher(raw_cipher)
     if cipher:
         outbound["cipher"] = cipher
-    else:
-        outbound.pop("cipher", None)
-    auth = normalize_auth_digest(outbound.get("auth"))
+    elif raw_cipher:
+        raise ValueError(f"Unsupported OpenVPN data cipher `{raw_cipher}`")
+    raw_auth = str(outbound.get("auth") or "").strip()
+    auth = normalize_auth_digest(raw_auth)
     if auth:
         outbound["auth"] = auth
-    else:
-        outbound.pop("auth", None)
+    elif raw_auth:
+        raise ValueError(f"Unsupported OpenVPN auth digest `{raw_auth}`")
 
     tls = outbound.get("tls")
     if isinstance(tls, dict):
-        suites = normalize_tls_cipher_suites(tls.get("cipher_suites"))
+        raw_suites = tls.get("cipher_suites")
+        suites = normalize_tls_cipher_suites(raw_suites)
         if suites:
             tls["cipher_suites"] = suites
-        else:
-            tls.pop("cipher_suites", None)
+        elif raw_suites not in (None, "", [], (), set()):
+            raise ValueError("Unsupported OpenVPN TLS cipher suite")
         verify_mode = str(tls.get("verify_x509_name_mode") or "").strip().lower()
         if verify_mode == "exact":
             verify_mode = "name"

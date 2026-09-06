@@ -363,6 +363,12 @@ def _camel_to_snake(value: str) -> str:
 
 def _build_stream_settings(params: dict[str, str], default_network: str = "tcp", default_security: str = "none") -> dict[str, Any]:
     network = (_get_param(params, "type", "net", default=default_network or "tcp") or "tcp").lower()
+    network = {
+        "gun": "grpc",
+        "http-upgrade": "httpupgrade",
+        "splithttp": "xhttp",
+        "split-http": "xhttp",
+    }.get(network, network)
     security = (_get_param(params, "security", "tls", default=default_security or "none") or "none").lower()
     if security == "none" and _get_param(params, "tls") == "tls":
         security = "tls"
@@ -381,6 +387,20 @@ def _build_stream_settings(params: dict[str, str], default_network: str = "tcp",
             ws_settings["path"] = path
         if host:
             ws_settings["headers"] = {"Host": host}
+        early_data = _get_param(params, "ed", "maxEarlyData", "max_early_data")
+        if early_data:
+            try:
+                ws_settings["maxEarlyData"] = int(early_data)
+            except (TypeError, ValueError):
+                ws_settings["maxEarlyData"] = early_data
+        early_data_header = _get_param(
+            params,
+            "eh",
+            "earlyDataHeaderName",
+            "early_data_header_name",
+        )
+        if early_data_header:
+            ws_settings["earlyDataHeaderName"] = early_data_header
         stream["wsSettings"] = ws_settings
     elif network in {"http", "h2"}:
         http_settings: dict[str, Any] = {}
@@ -388,6 +408,16 @@ def _build_stream_settings(params: dict[str, str], default_network: str = "tcp",
             http_settings["host"] = [h.strip() for h in host.split(",") if h.strip()]
         if path:
             http_settings["path"] = path
+        for source_key, target_key in (
+            ("method", "method"),
+            ("idleTimeout", "idleTimeout"),
+            ("idle_timeout", "idleTimeout"),
+            ("pingTimeout", "pingTimeout"),
+            ("ping_timeout", "pingTimeout"),
+        ):
+            value = _get_param(params, source_key)
+            if value:
+                http_settings[target_key] = value
         stream["httpSettings"] = http_settings
     elif network == "grpc":
         grpc_settings: dict[str, Any] = {}
@@ -400,6 +430,22 @@ def _build_stream_settings(params: dict[str, str], default_network: str = "tcp",
         mode = _get_param(params, "mode")
         if mode == "multi":
             grpc_settings["multiMode"] = True
+        for source_key, target_key in (
+            ("idleTimeout", "idleTimeout"),
+            ("idle_timeout", "idleTimeout"),
+            ("pingTimeout", "pingTimeout"),
+            ("ping_timeout", "pingTimeout"),
+        ):
+            value = _get_param(params, source_key)
+            if value:
+                grpc_settings[target_key] = value
+        permit_without_stream = _get_param(
+            params,
+            "permitWithoutStream",
+            "permit_without_stream",
+        )
+        if permit_without_stream:
+            grpc_settings["permitWithoutStream"] = _to_bool(permit_without_stream)
         stream["grpcSettings"] = grpc_settings
     elif network == "xhttp":
         xhttp_settings: dict[str, Any] = {}
@@ -427,10 +473,32 @@ def _build_stream_settings(params: dict[str, str], default_network: str = "tcp",
             "downloadSettings",
             "download_settings",
             "noGRPCHeader",
+            "noSSEHeader",
+            "scStreamUpServerSecs",
+            "serverMaxHeaderBytes",
+            "trustedXForwardedFor",
+            "xmux",
+            "xPaddingObfsMode",
+            "xPaddingKey",
+            "xPaddingHeader",
+            "xPaddingPlacement",
+            "xPaddingMethod",
+            "uplinkHTTPMethod",
+            "sessionPlacement",
+            "sessionKey",
+            "seqPlacement",
+            "seqKey",
+            "uplinkDataPlacement",
+            "uplinkDataKey",
+            "uplinkChunkSize",
+            "sessionIDTable",
+            "sessionIDLength",
+            "congestionController",
+            "cwnd",
         ):
             value = _get_param(params, key)
             if value:
-                if key in {"downloadSettings", "download_settings"}:
+                if key in {"downloadSettings", "download_settings", "xmux"}:
                     try:
                         xhttp_settings[key] = json.loads(unquote(value))
                     except Exception:
@@ -509,6 +577,21 @@ def _build_stream_settings(params: dict[str, str], default_network: str = "tcp",
             tls_settings["verifyPeerCertByName"] = ",".join(
                 item.strip() for item in verify_names.split(",") if item.strip()
             )
+        for aliases, target_key in (
+            (("disableSNI", "disable_sni"), "disableSNI"),
+            (("minVersion", "min_version"), "minVersion"),
+            (("maxVersion", "max_version"), "maxVersion"),
+            (("cipherSuites", "cipher_suites"), "cipherSuites"),
+            (("curvePreferences", "curve_preferences"), "curvePreferences"),
+            (("handshakeTimeout", "handshake_timeout"), "handshakeTimeout"),
+        ):
+            value = _get_param(params, *aliases)
+            if value:
+                tls_settings[target_key] = (
+                    [item.strip() for item in value.split(",") if item.strip()]
+                    if target_key in {"cipherSuites", "curvePreferences"}
+                    else (_to_bool(value) if target_key == "disableSNI" else value)
+                )
         stream["tlsSettings"] = tls_settings
     elif security == "reality":
         reality_settings: dict[str, Any] = {}
@@ -1116,7 +1199,14 @@ def _parse_shadowsocks(link: str) -> Node:
         "password": password,
     }
     if plugin:
-        outbound_server["plugin"] = plugin
+        # SIP003 stores the plugin executable and its options in one query
+        # value (``v2ray-plugin;tls;host=...``), while sing-box models them as
+        # two fields.  Passing the complete value as the executable name makes
+        # an otherwise valid Shadowsocks server fail only when it is dialled.
+        plugin_name, separator, plugin_opts = plugin.partition(";")
+        outbound_server["plugin"] = plugin_name
+        if separator and plugin_opts:
+            outbound_server["plugin_opts"] = plugin_opts
 
     outbound = {
         "protocol": "shadowsocks",
@@ -1190,6 +1280,12 @@ def _parse_http_proxy(link: str) -> Node:
         "protocol": "http",
         "settings": {"servers": [server_item]},
     }
+    if parsed.scheme.lower() == "https":
+        outbound["streamSettings"] = {
+            "network": "tcp",
+            "security": "tls",
+            "tlsSettings": {"serverName": server},
+        }
 
     name = _clean_name(parsed.fragment, f"http-{server}:{port}")
     return Node(
@@ -1921,7 +2017,13 @@ def _clash_to_xray_outbound(payload: dict[str, Any], kind: str) -> dict[str, Any
         "protocol": kind,
         "settings": settings,
     }
-    if kind not in {"socks", "http"}:
+    if kind not in {"socks", "http"} or (
+        kind == "http"
+        and (
+            _to_bool(payload.get("tls"))
+            or str(payload.get("servername") or payload.get("sni") or "").strip()
+        )
+    ):
         outbound["streamSettings"] = _clash_stream_settings(payload)
     return outbound
 
@@ -1965,6 +2067,19 @@ def _clash_stream_settings(payload: dict[str, Any]) -> dict[str, Any]:
         authority = grpc_opts.get("authority") or grpc_opts.get("grpc-authority") or grpc_opts.get("grpc_authority") or payload.get("grpc-authority") or payload.get("grpc_authority")
         if authority:
             grpc_settings["authority"] = str(authority)
+        for clash_key, target_key in (
+            ("idle-timeout", "idleTimeout"),
+            ("idle_timeout", "idleTimeout"),
+            ("ping-timeout", "pingTimeout"),
+            ("ping_timeout", "pingTimeout"),
+        ):
+            if grpc_opts.get(clash_key) not in (None, ""):
+                grpc_settings[target_key] = grpc_opts[clash_key]
+        permit = grpc_opts.get("permit-without-stream", grpc_opts.get("permit_without_stream"))
+        if permit not in (None, ""):
+            grpc_settings["permitWithoutStream"] = _to_bool(permit)
+        if _to_bool(grpc_opts.get("multi-mode", grpc_opts.get("multi_mode", False))):
+            grpc_settings["multiMode"] = True
         stream["grpcSettings"] = grpc_settings
     elif network in {"http", "h2"}:
         host = http_opts.get("host") or payload.get("host") or []
@@ -1978,13 +2093,21 @@ def _clash_stream_settings(payload: dict[str, Any]) -> dict[str, Any]:
             http_settings["headers"] = deepcopy(http_opts["headers"])
         if http_opts.get("method"):
             http_settings["method"] = str(http_opts["method"])
+        for clash_key, target_key in (
+            ("idle-timeout", "idleTimeout"),
+            ("idle_timeout", "idleTimeout"),
+            ("ping-timeout", "pingTimeout"),
+            ("ping_timeout", "pingTimeout"),
+        ):
+            if http_opts.get(clash_key) not in (None, ""):
+                http_settings[target_key] = http_opts[clash_key]
         stream["httpSettings"] = http_settings
     elif network == "xhttp":
-        stream["xhttpSettings"] = {
-            "path": str(xhttp_opts.get("path") or payload.get("path") or "/"),
-            "host": str(xhttp_opts.get("host") or payload.get("host") or ""),
-            "mode": str(xhttp_opts.get("mode") or payload.get("mode") or "auto"),
-        }
+        xhttp_settings = deepcopy(xhttp_opts)
+        xhttp_settings.setdefault("path", str(payload.get("path") or "/"))
+        xhttp_settings.setdefault("host", str(payload.get("host") or ""))
+        xhttp_settings.setdefault("mode", str(payload.get("mode") or "auto"))
+        stream["xhttpSettings"] = xhttp_settings
 
     if security == "tls":
         tls_settings = {
@@ -2008,6 +2131,14 @@ def _clash_stream_settings(payload: dict[str, Any]) -> dict[str, Any]:
             "shortId": str(reality_opts.get("short-id") or reality_opts.get("shortId") or payload.get("sid") or ""),
             "spiderX": str(reality_opts.get("spider-x") or reality_opts.get("spiderX") or payload.get("spx") or "/"),
         }
+        mldsa = (
+            reality_opts.get("mldsa65-verify")
+            or reality_opts.get("mldsa65_verify")
+            or reality_opts.get("mldsa65Verify")
+            or payload.get("pqv")
+        )
+        if mldsa:
+            stream["realitySettings"]["mldsa65Verify"] = str(mldsa)
     return stream
 
 

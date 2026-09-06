@@ -755,6 +755,13 @@ def _install_crash_guards() -> None:
         pass
 
 
+def _should_start_in_tray(arguments: list[str], initial_deep_link: str = "") -> bool:
+    """Hide only genuine OS-autostarts, never an app-initiated relaunch."""
+    flags = set(arguments[1:])
+    internal_relaunch = bool(flags & {"--relaunched", "--relaunch-as-admin"})
+    return "--tray" in flags and not internal_relaunch and not initial_deep_link
+
+
 def _load_bundled_fonts() -> None:
     try:
         from PyQt6.QtGui import QFontDatabase
@@ -912,7 +919,7 @@ def main(argv: list[str] | None = None) -> int:
     if not QMetaObject.invokeMethod(window, "applyStartupWindowGeometry"):
         window.setMinimumWidth(640)
         window.setMinimumHeight(360)
-    start_in_tray = "--tray" in launch_arguments[1:] and not initial_deep_link
+    start_in_tray = _should_start_in_tray(launch_arguments, initial_deep_link)
 
     if single_server is not None:
         active_connections: set[object] = set()

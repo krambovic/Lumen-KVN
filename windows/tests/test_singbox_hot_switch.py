@@ -6,7 +6,11 @@ import json
 
 from xray_fluent.application.signature_service import transition_signature, tun_layer_signature
 from xray_fluent.application.transition_engine import can_tun_hot_swap
-from xray_fluent.engines.singbox.runtime_planner import parse_singbox_document, plan_singbox_runtime
+from xray_fluent.engines.singbox.runtime_planner import (
+    parse_singbox_document,
+    plan_singbox_runtime,
+    singbox_node_tag,
+)
 from xray_fluent.models import AppSettings, Node, RoutingSettings
 
 
@@ -84,7 +88,24 @@ def test_tun_hot_swap_requires_a_selected_node() -> None:
     )
 
 
-def test_selector_is_not_added_to_a_proxy_runtime() -> None:
+def test_selector_hot_swap_is_available_in_system_proxy_mode() -> None:
+    session = SimpleNamespace(
+        active_core="singbox",
+        tun_mode=False,
+        hybrid=False,
+        clash_api_selector="proxy",
+        tun_layer_signature="same",
+    )
+
+    assert can_tun_hot_swap(
+        session=session,
+        settings_tun_mode=False,
+        has_selected_node=True,
+        current_tun_layer_signature="same",
+    )
+
+
+def test_selector_is_added_to_a_proxy_runtime() -> None:
     payload = {
         "inbounds": [],
         "outbounds": [
@@ -104,5 +125,93 @@ def test_selector_is_not_added_to_a_proxy_runtime() -> None:
         hot_switch_nodes=(_node("node-a"), _node("node-b")),
     )
 
-    assert plan.clash_api_selector == ""
-    assert not any(item.get("type") == "selector" and item.get("tag") == "proxy" for item in plan.singbox_config["outbounds"])
+    assert plan.clash_api_selector == "proxy"
+    assert any(item.get("type") == "selector" and item.get("tag") == "proxy" for item in plan.singbox_config["outbounds"])
+
+
+def test_proxy_hot_switch_selector_preserves_vless_encryption() -> None:
+    encrypted = _node("encrypted")
+    encryption = "mlkem768x25519plus.native.0rtt.test-key"
+    encrypted.outbound["settings"]["vnext"][0]["users"][0].update(
+        {
+            "flow": "xtls-rprx-vision",
+            "encryption": encryption,
+        }
+    )
+    fallback = _node("fallback")
+    payload = {
+        "inbounds": [],
+        "outbounds": [
+            {"type": "direct", "tag": "proxy"},
+            {"type": "direct", "tag": "direct"},
+        ],
+        "route": {"rules": [], "final": "proxy"},
+    }
+    document = parse_singbox_document(Path("default.json"), json.dumps(payload))
+
+    plan = plan_singbox_runtime(
+        document,
+        encrypted,
+        routing=RoutingSettings(mode="global"),
+        tun_mode=False,
+        enable_hot_switch=True,
+        hot_switch_nodes=(encrypted, fallback),
+    )
+    member = next(
+        item
+        for item in plan.singbox_config["outbounds"]
+        if item.get("tag", "").startswith("lumen-node-") and item.get("encryption") == encryption
+    )
+
+    assert plan.clash_api_selector == "proxy"
+    assert member["flow"] == "xtls-rprx-vision"
+
+
+def test_hot_switch_selector_does_not_start_unselected_masque() -> None:
+    selected = _node("selected")
+    fallback = _node("fallback")
+    masque = Node(
+        id="masque",
+        name="masque",
+        server="162.159.198.2",
+        port=443,
+        scheme="masque",
+        outbound={
+            "protocol": "masque",
+            "singbox": {
+                "type": "masque",
+                "server": "162.159.198.2",
+                "server_port": 443,
+            },
+        },
+    )
+    payload = {
+        "inbounds": [],
+        "outbounds": [
+            {"type": "direct", "tag": "proxy"},
+            {"type": "direct", "tag": "direct"},
+        ],
+        "route": {"rules": [], "final": "proxy"},
+    }
+    document = parse_singbox_document(Path("default.json"), json.dumps(payload))
+
+    plan = plan_singbox_runtime(
+        document,
+        selected,
+        routing=RoutingSettings(mode="global"),
+        tun_mode=False,
+        enable_hot_switch=True,
+        hot_switch_nodes=(selected, fallback, masque),
+    )
+
+    selector = next(
+        item
+        for item in plan.singbox_config["outbounds"]
+        if item.get("type") == "selector" and item.get("tag") == "proxy"
+    )
+    assert singbox_node_tag(masque.id) not in selector["outbounds"]
+    assert not any(
+        item.get("type") == "masque"
+        for item in plan.singbox_config["outbounds"]
+        if isinstance(item, dict)
+    )

@@ -4,6 +4,9 @@ import base64
 import json
 from pathlib import Path
 import subprocess
+from urllib.parse import quote
+
+import pytest
 
 from xray_fluent.engines.singbox.config_builder import build_singbox_outbound
 from xray_fluent.engines.singbox.runtime_planner import parse_singbox_document, plan_singbox_runtime
@@ -14,7 +17,7 @@ from xray_fluent.link_parser import (
     repair_node_outbound_from_link,
     validate_node_outbound,
 )
-from xray_fluent.models import RoutingSettings
+from xray_fluent.models import Node, RoutingSettings
 
 
 def _base_config() -> dict:
@@ -1218,3 +1221,466 @@ def test_runtime_omits_deprecated_independent_dns_cache_option() -> None:
     ).singbox_config
 
     assert "independent_cache" not in runtime["dns"]
+
+
+def test_grpc_authority_without_tls_is_not_silently_discarded() -> None:
+    nodes, errors = parse_links_text(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:443"
+        "?type=grpc&serviceName=lumen&authority=legacy.example.com#grpc"
+    )
+
+    assert errors == []
+    with pytest.raises(ValueError, match="authority"):
+        build_singbox_outbound(nodes[0], tag="proxy")
+
+
+def test_vless_native_outbound_states_xudp_packet_encoding() -> None:
+    node = parse_single(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:443?type=tcp"
+    )
+
+    assert build_singbox_outbound(node)["packet_encoding"] == "xudp"
+
+
+def test_reality_without_fingerprint_uses_interoperable_utls_default() -> None:
+    node = parse_single(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:443"
+        "?type=tcp&security=reality&sni=www.example.com"
+        "&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef"
+    )
+
+    assert build_singbox_outbound(node)["tls"]["utls"] == {
+        "enabled": True,
+        "fingerprint": "chrome",
+    }
+
+
+def test_tls_certificate_pin_alias_is_preserved_and_normalized() -> None:
+    node = parse_single(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:443"
+        f"?type=tcp&security=tls&pcs={'ab' * 32}"
+    )
+
+    assert build_singbox_outbound(node)["tls"]["certificate_public_key_sha256"] == [
+        base64.b64encode(bytes.fromhex("ab" * 32)).decode("ascii")
+    ]
+
+
+def test_ws_early_data_query_is_preserved() -> None:
+    node = parse_single(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:443"
+        "?type=ws&security=tls&path=%2Fws&ed=2048&eh=Sec-WebSocket-Protocol"
+    )
+
+    assert build_singbox_outbound(node)["transport"] == {
+        "type": "ws",
+        "path": "/ws",
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol",
+    }
+
+
+def test_ws_early_data_embedded_in_path_is_normalized() -> None:
+    node = parse_single(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:443"
+        "?type=ws&security=tls&path=%2Fproxy%3Fed%3D3072"
+    )
+
+    assert build_singbox_outbound(node)["transport"] == {
+        "type": "ws",
+        "path": "/proxy",
+        "max_early_data": 3072,
+        "early_data_header_name": "Sec-WebSocket-Protocol",
+    }
+
+
+def test_https_proxy_keeps_tls_when_converted_to_singbox() -> None:
+    outbound = build_singbox_outbound(parse_single("https://user:pass@example.com:8443"))
+
+    assert outbound["type"] == "http"
+    assert outbound["username"] == "user"
+    assert outbound["tls"] == {"enabled": True, "server_name": "example.com"}
+
+
+def test_sip003_shadowsocks_plugin_is_split_from_options() -> None:
+    credentials = base64.urlsafe_b64encode(b"aes-256-gcm:secret").decode("ascii").rstrip("=")
+    node = parse_single(
+        f"ss://{credentials}@example.com:8388?plugin=v2ray-plugin%3Btls%3Bhost%3Dcdn.example.com"
+    )
+    outbound = build_singbox_outbound(node)
+
+    assert outbound["plugin"] == "v2ray-plugin"
+    assert outbound["plugin_opts"] == "tls;host=cdn.example.com"
+
+
+def test_xhttp_download_settings_use_exact_extended_core_schema() -> None:
+    node = parse_single(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:443"
+        "?type=xhttp&security=tls&path=%2Fupload&extra="
+        + quote(
+            json.dumps(
+                {
+                    "noSSEHeader": True,
+                    "sessionIDLength": "12-18",
+                    "downloadSettings": {
+                        "address": "download.example.com",
+                        "port": 8443,
+                        "streamSettings": {
+                            "security": "tls",
+                            "tlsSettings": {"serverName": "cdn.example.com"},
+                            "xhttpSettings": {"path": "/download", "xPaddingBytes": "50-100"},
+                        },
+                    },
+                },
+                separators=(",", ":"),
+            ),
+            safe="",
+        )
+    )
+    transport = build_singbox_outbound(node)["transport"]
+
+    assert "download_settings" not in transport
+    assert transport["no_sse_header"] is True
+    assert transport["session_id_length"] == "12-18"
+    assert transport["download"]["server"] == "download.example.com"
+    assert transport["download"]["server_port"] == 8443
+    assert transport["download"]["path"] == "/download"
+    assert transport["download"]["tls"]["server_name"] == "cdn.example.com"
+
+
+def test_unknown_xray_transport_fails_instead_of_becoming_raw_tcp() -> None:
+    node = Node(
+        scheme="vless",
+        outbound={
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": "example.com",
+                    "port": 443,
+                    "users": [{"id": "00000000-0000-0000-0000-000000000000"}],
+                }]
+            },
+            "streamSettings": {"network": "future-transport", "security": "none"},
+        },
+    )
+
+    with pytest.raises(ValueError, match="future-transport"):
+        build_singbox_outbound(node)
+
+
+def test_vless_vision_is_kept_for_grpc_reality_outbound() -> None:
+    nodes, errors = parse_links_text(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:443"
+        "?type=grpc&security=reality&flow=xtls-rprx-vision&sni=example.com"
+        "&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef#grpc-vision"
+    )
+
+    assert errors == []
+    outbound = build_singbox_outbound(nodes[0], tag="proxy")
+
+    assert outbound["transport"]["type"] == "grpc"
+    assert outbound["tls"]["reality"]["enabled"] is True
+    assert outbound["flow"] == "xtls-rprx-vision"
+
+
+def test_vless_encryption_keeps_vision_on_framed_transport() -> None:
+    nodes, errors = parse_links_text(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:443"
+        "?type=grpc&security=reality&flow=xtls-rprx-vision"
+        "&encryption=mlkem768x25519plus.native.0rtt.key&sni=example.com"
+        "&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef"
+    )
+
+    assert errors == []
+    assert build_singbox_outbound(nodes[0])["flow"] == "xtls-rprx-vision"
+
+
+@pytest.mark.parametrize("tun_mode", [False, True])
+def test_vless_vision_is_kept_for_xhttp_reality_runtime(tun_mode: bool) -> None:
+    nodes, errors = parse_links_text(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:443"
+        "?type=xhttp&security=reality&flow=xtls-rprx-vision&sni=example.com"
+        "&path=%2Flumen&mode=auto&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "&sid=0123456789abcdef#xhttp-vision"
+    )
+
+    assert errors == []
+    document = parse_singbox_document(Path("default.json"), json.dumps(_base_config()))
+    runtime = plan_singbox_runtime(
+        document,
+        nodes[0],
+        routing=RoutingSettings(mode="global"),
+        tun_mode=tun_mode,
+    ).singbox_config
+    outbound = next(
+        item for item in runtime["outbounds"] if item.get("tag") == "proxy"
+    )
+
+    assert outbound["flow"] == "xtls-rprx-vision"
+    assert outbound["transport"]["type"] == "xhttp"
+    assert outbound["tls"]["reality"]["enabled"] is True
+
+
+def test_vless_vision_is_kept_for_raw_reality_outbound() -> None:
+    nodes, errors = parse_links_text(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:443"
+        "?type=tcp&security=reality&flow=xtls-rprx-vision&sni=example.com"
+        "&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef#tcp-vision"
+    )
+
+    assert errors == []
+    outbound = build_singbox_outbound(nodes[0], tag="proxy")
+
+    assert outbound["flow"] == "xtls-rprx-vision"
+    assert "transport" not in outbound
+    assert outbound["tls"]["reality"]["enabled"] is True
+
+
+def test_vless_encryption_is_preserved_for_singbox_outbound() -> None:
+    encryption = "mlkem768x25519plus.native.0rtt.test_key-with.dots"
+    nodes, errors = parse_links_text(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:8443"
+        f"?encryption={encryption}&type=tcp&flow=xtls-rprx-vision"
+        "&security=reality&sni=www.bing.com&fp=edge"
+        "&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef#encrypted-vision"
+    )
+
+    assert errors == []
+    outbound = build_singbox_outbound(nodes[0], tag="proxy")
+
+    assert outbound["encryption"] == encryption
+    assert outbound["flow"] == "xtls-rprx-vision"
+    assert outbound["tls"]["reality"]["enabled"] is True
+
+
+def test_vless_vision_without_tls_or_encryption_is_removed() -> None:
+    nodes, errors = parse_links_text(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:443"
+        "?type=tcp&security=none&flow=xtls-rprx-vision#plain-vision"
+    )
+
+    assert errors == []
+    outbound = build_singbox_outbound(nodes[0], tag="proxy")
+
+    assert "flow" not in outbound
+    assert "tls" not in outbound
+
+
+def test_imported_singbox_config_keeps_transport_vless_vision_with_tls() -> None:
+    payload = _base_config()
+    payload["outbounds"][0] = {
+        "type": "vless",
+        "tag": "proxy",
+        "server": "example.com",
+        "server_port": 443,
+        "uuid": "00000000-0000-0000-0000-000000000000",
+        "flow": "xtls-rprx-vision",
+        "tls": {"enabled": True},
+        "transport": {"type": "grpc", "service_name": "lumen"},
+    }
+    node = Node(
+        scheme="singbox_config",
+        outbound={"protocol": "singbox_config", "singbox_config": payload},
+    )
+
+    document = parse_singbox_document(Path("vision.json"), json.dumps(payload))
+    plan = plan_singbox_runtime(document, node, tun_mode=False)
+    proxy = next(item for item in plan.singbox_config["outbounds"] if item.get("tag") == "proxy")
+
+    assert proxy["flow"] == "xtls-rprx-vision"
+
+
+def test_imported_singbox_grpc_authority_is_mapped_without_losing_semantics() -> None:
+    payload = _base_config()
+    payload["outbounds"][0] = {
+        "type": "vless",
+        "tag": "proxy",
+        "server": "example.com",
+        "server_port": 443,
+        "uuid": "00000000-0000-0000-0000-000000000000",
+        "tls": {"enabled": True},
+        "transport": {
+        "type": "grpc",
+        "service_name": "lumen",
+        "authority": "legacy.example.com",
+        },
+    }
+    node = Node(
+        scheme="singbox_config",
+        outbound={
+            "protocol": "singbox_config",
+            "singbox_config": payload,
+        },
+    )
+
+    document = parse_singbox_document(Path("authority.json"), json.dumps(payload))
+    plan = plan_singbox_runtime(
+        document,
+        node,
+        tun_mode=False,
+    )
+
+    proxy = next(
+        item for item in plan.singbox_config["outbounds"] if item.get("tag") == "proxy"
+    )
+    assert "authority" not in proxy["transport"]
+    assert proxy["tls"]["server_name"] == "legacy.example.com"
+
+
+@pytest.mark.parametrize(
+    ("transport", "message"),
+    [
+        ({"type": "grpc", "multi_mode": True}, "multi-mode"),
+        ({"type": "httpupgrade", "path": "/up?ed=2048"}, "early-data"),
+        ({"type": "quic", "security": "aes-128-gcm"}, "QUIC"),
+    ],
+)
+def test_native_transport_semantics_are_rejected_instead_of_silently_removed(
+    transport: dict,
+    message: str,
+) -> None:
+    node = Node(
+        scheme="vless",
+        server="example.com",
+        port=443,
+        outbound={
+            "protocol": "vless",
+            "singbox": {
+                "type": "vless",
+                "server": "example.com",
+                "server_port": 443,
+                "uuid": "00000000-0000-0000-0000-000000000000",
+                "transport": transport,
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match=message):
+        build_singbox_outbound(node)
+
+
+def test_native_reality_extension_is_not_silently_removed() -> None:
+    node = Node(
+        scheme="vless",
+        server="example.com",
+        port=443,
+        outbound={
+            "protocol": "vless",
+            "singbox": {
+                "type": "vless",
+                "server": "example.com",
+                "server_port": 443,
+                "uuid": "00000000-0000-0000-0000-000000000000",
+                "tls": {
+                    "enabled": True,
+                    "reality": {
+                        "enabled": True,
+                        "mldsa65Verify": "post-quantum-key",
+                    },
+                },
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="ML-DSA"):
+        build_singbox_outbound(node)
+
+
+def test_xhttp_download_detour_is_migrated_to_download_block() -> None:
+    node = Node(
+        scheme="vless",
+        server="example.com",
+        port=443,
+        outbound={
+            "protocol": "vless",
+            "singbox": {
+                "type": "vless",
+                "server": "example.com",
+                "server_port": 443,
+                "uuid": "00000000-0000-0000-0000-000000000000",
+                "transport": {
+                    "type": "xhttp",
+                    "download_detour": "download-direct",
+                    "download": {
+                        "server": "download.example.com",
+                        "server_port": 443,
+                    },
+                },
+            },
+        },
+    )
+
+    transport = build_singbox_outbound(node)["transport"]
+
+    assert "download_detour" not in transport
+    assert transport["download"]["detour"] == "download-direct"
+
+
+def test_saved_native_aliases_are_migrated_without_reimport() -> None:
+    node = Node(
+        scheme="vless",
+        server="example.com",
+        port=443,
+        outbound={
+            "protocol": "vless",
+            "singbox": {
+                "type": "vless",
+                "server": "example.com",
+                "server_port": 443,
+                "uuid": "00000000-0000-0000-0000-000000000000",
+                "tls": {
+                    "enabled": True,
+                    "serverName": "cdn.example.com",
+                    "pinnedPeerCertSha256": "cd" * 32,
+                },
+                "transport": {
+                    "type": "ws",
+                    "path": "/proxy?ed=4096",
+                    "maxEarlyData": "4096",
+                    "earlyDataHeaderName": "Sec-WebSocket-Protocol",
+                },
+            },
+        },
+    )
+
+    outbound = build_singbox_outbound(node)
+    assert outbound["tls"]["server_name"] == "cdn.example.com"
+    assert "serverName" not in outbound["tls"]
+    assert outbound["tls"]["certificate_public_key_sha256"] == [
+        base64.b64encode(bytes.fromhex("cd" * 32)).decode("ascii")
+    ]
+    assert outbound["transport"]["path"] == "/proxy"
+    assert outbound["transport"]["max_early_data"] == 4096
+    assert "maxEarlyData" not in outbound["transport"]
+
+
+def test_saved_legacy_xhttp_download_key_is_migrated() -> None:
+    node = Node(
+        scheme="vless",
+        server="example.com",
+        port=443,
+        outbound={
+            "protocol": "vless",
+            "singbox": {
+                "type": "vless",
+                "server": "example.com",
+                "server_port": 443,
+                "uuid": "00000000-0000-0000-0000-000000000000",
+                "transport": {
+                    "type": "xhttp",
+                    "x_padding_bytes": "100-1000",
+                    "download_settings": {
+                        "server": "download.example.com",
+                        "server_port": 8443,
+                        "path": "/download",
+                        "x_padding_bytes": "50-100",
+                    },
+                },
+            },
+        },
+    )
+
+    transport = build_singbox_outbound(node)["transport"]
+    assert "download_settings" not in transport
+    assert transport["download"]["server"] == "download.example.com"
+    assert transport["download"]["server_port"] == 8443

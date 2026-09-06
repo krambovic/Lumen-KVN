@@ -11,6 +11,7 @@ from xray_fluent.application.worker_service import (
     speed_test_nodes,
 )
 from xray_fluent.models import Node
+from xray_fluent import ping_worker
 
 
 class _Signal:
@@ -82,19 +83,10 @@ def _native_node(node_id: str, protocol: str) -> Node:
     )
 
 
-def test_awg_and_masque_ping_warning_is_emitted_once_for_bulk_selection() -> None:
+def test_awg_and_masque_endpoint_ping_are_supported() -> None:
     nodes = [_native_node("awg", "awg"), _native_node("masque", "masque")]
-    controller = _CompatibilityController(nodes)
 
-    ping_nodes(controller, {node.id for node in nodes}, method="tcping")
-
-    assert len(controller.status.calls) == 1
-    level, message = controller.status.calls[0]
-    assert level == "warning"
-    assert "AWG" in message and "MASQUE" in message
-    assert controller._ping_worker is None
-    assert controller.ping_updated.calls == []
-    assert all(node.is_alive is None and node.ping_ms is None for node in nodes)
+    assert all(_node_supports_test(node, "ping", ping_method="tcping") for node in nodes)
 
 
 def test_native_speed_warning_is_emitted_once_for_bulk_selection() -> None:
@@ -110,17 +102,23 @@ def test_native_speed_warning_is_emitted_once_for_bulk_selection() -> None:
     assert all(node.is_alive is None and node.speed_mbps is None for node in nodes)
 
 
-def test_hysteria2_and_tuic_real_ping_warning_is_emitted_once() -> None:
+def test_hysteria2_and_tuic_real_ping_are_supported_by_endpoint_fallback() -> None:
     nodes = [_native_node("hy2", "hysteria2"), _native_node("tuic", "tuic")]
-    controller = _CompatibilityController(nodes)
 
-    ping_nodes(controller, {node.id for node in nodes}, method="real")
+    assert all(_node_supports_test(node, "ping", ping_method="real") for node in nodes)
 
-    assert len(controller.status.calls) == 1
-    assert "HY2" in controller.status.calls[0][1]
-    assert "TUIC" in controller.status.calls[0][1]
-    assert controller.ping_updated.calls == []
-    assert all(node.is_alive is None and node.ping_ms is None for node in nodes)
+
+def test_hysteria_protocol_ping_uses_udp_probe_with_icmp_fallback(monkeypatch) -> None:
+    calls: list[tuple[str, int, float]] = []
+
+    monkeypatch.setattr(ping_worker, "udp_ping", lambda host, port, timeout: calls.append((host, port, timeout)) or None)
+    monkeypatch.setattr(ping_worker, "icmp_ping", lambda host, timeout_ms: 37)
+
+    node = _native_node("hy2", "hysteria2")
+    worker = ping_worker.PingWorker([node], timeout=1.5, method="tcping")
+
+    assert worker._measure(node) == 37
+    assert calls == [("203.0.113.10", 443, 1.5)]
 
 
 def _xray_auto_node(*outbounds: dict) -> Node:

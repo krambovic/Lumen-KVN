@@ -155,12 +155,15 @@ def try_hot_switch_selector(controller: AppController, reason: str) -> bool:
         session is None
         or node is None
         or session.active_core != "singbox"
-        or not session.tun_mode
         or getattr(session, "node_id", None) == node.id
-        or session.hybrid
+        or getattr(session, "hybrid", False)
         or not session.clash_api_selector
         or not session.clash_api_secret
     ):
+        return False
+
+    settings = getattr(getattr(controller, "state", None), "settings", None)
+    if settings is not None and bool(getattr(settings, "tun_mode", session.tun_mode)) != bool(session.tun_mode):
         return False
 
     node_signatures = dict(getattr(session, "clash_api_node_signatures", ()) or ())
@@ -190,8 +193,8 @@ def try_hot_switch_selector(controller: AppController, reason: str) -> bool:
     )
     controller._capture_active_session(
         node,
-        tun=True,
-        core="singbox",
+        tun=bool(session.tun_mode),
+        core=session.active_core,
         api_port=session.api_port,
         clash_api_secret=session.clash_api_secret,
         clash_api_selector=session.clash_api_selector,
@@ -207,7 +210,8 @@ def try_hot_switch_selector(controller: AppController, reason: str) -> bool:
         ping_port=ping_port,
     )
     label = node.name or node.server
-    controller._set_connection_status("running", f"Переключено: {label} (TUN)", level="success")
+    mode_label = "TUN" if session.tun_mode else "прокси"
+    controller._set_connection_status("running", f"Переключено: {label} ({mode_label})", level="success")
     controller.save()
     controller._metrics_request.emit(True)
     return True
@@ -215,11 +219,13 @@ def try_hot_switch_selector(controller: AppController, reason: str) -> bool:
 
 def restart_runtime(controller: AppController, reason: str) -> bool:
     node = controller.selected_node
+    tun_mode = bool(controller.state.settings.tun_mode)
     controller._switching = True
     try:
-        controller._log(f"[tun-hot-swap] {reason}")
+        log_prefix = "tun-hot-swap" if tun_mode else "proxy-hot-swap"
+        controller._log(f"[{log_prefix}] {reason}")
         try:
-            plan = controller._plan_runtime_singbox(node)
+            plan = controller._plan_runtime_singbox(node, tun_mode=tun_mode)
         except (ValueError, RuntimeError) as exc:
             controller._set_connection_status("error", str(exc), level="error")
             return False
@@ -261,9 +267,9 @@ def restart_runtime(controller: AppController, reason: str) -> bool:
         dns = plan.singbox_config.get("dns") if isinstance(plan.singbox_config, dict) else {}
         route_final = route.get("final") if isinstance(route, dict) else ""
         dns_final = dns.get("final") if isinstance(dns, dict) else ""
-        controller._log(f"[tun-hot-swap] routing final={route_final or '--'} dns_final={dns_final or '--'}")
+        controller._log(f"[{log_prefix}] routing final={route_final or '--'} dns_final={dns_final or '--'}")
         for line in _runtime_summary_lines(plan.singbox_config):
-            controller._log(f"[tun-hot-swap] {line}")
+            controller._log(f"[{log_prefix}] {line}")
         controller._metrics_request.emit(False)
 
         if controller.singbox.is_running and not controller.singbox.stop(fast=True):
@@ -289,6 +295,27 @@ def restart_runtime(controller: AppController, reason: str) -> bool:
             controller._handle_unexpected_disconnect()
             return False
 
+        if not tun_mode:
+            settings = controller.state.settings
+            try:
+                if settings.enable_system_proxy:
+                    controller.proxy.enable(
+                        int(settings.local_http_port),
+                        int(settings.local_socks_port),
+                        bypass_lan=controller._system_proxy_bypass_lan(),
+                        configure_firefox=bool(settings.firefox_proxy_integration),
+                    )
+                else:
+                    controller.proxy.disable(restore_previous=True)
+            except Exception as exc:
+                controller._set_connection_status(
+                    "error",
+                    f"Не удалось применить системный прокси: {exc}",
+                    level="error",
+                )
+                controller._handle_unexpected_disconnect()
+                return False
+
         session_node = node if plan.used_selected_node else None
         if session_node is not None:
             session_node.last_used_at = datetime.now(timezone.utc).isoformat()
@@ -296,7 +323,7 @@ def restart_runtime(controller: AppController, reason: str) -> bool:
         ping_host, ping_port = controller._infer_singbox_ping_target(plan.singbox_config, session_node)
         controller._capture_active_session(
             session_node,
-            tun=True,
+            tun=tun_mode,
             core="singbox",
             api_port=0,
             clash_api_secret=plan.clash_api_secret,
@@ -312,7 +339,12 @@ def restart_runtime(controller: AppController, reason: str) -> bool:
         )
         controller._set_connection_status(
             "running",
-            f"Переключено: {session_label}" + (" (TUN, xray sidecar)" if plan.is_hybrid else " (TUN)"),
+            f"Переключено: {session_label}"
+            + (
+                " (TUN, xray sidecar)"
+                if plan.is_hybrid and tun_mode
+                else " (TUN)" if tun_mode else " (прокси)"
+            ),
             level="success",
         )
         controller.save()

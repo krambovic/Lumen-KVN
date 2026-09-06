@@ -20,6 +20,7 @@ import re
 import sys
 from pathlib import Path
 import socket
+from typing import Any
 
 from PyQt6.QtCore import QPoint, QRect, QObject, Qt, QThread, QTimer, QUrl, pyqtProperty, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QDesktopServices, QGuiApplication
@@ -245,9 +246,12 @@ class AppBridge(QObject):
         set_language(self._language)
         self._accent = "#0078D4"
 
-        # Активные фильтры списка серверов (группа/текст)
+        # Filled from persisted settings in load(), after state.enc has been
+        # decoded. Search text remains intentionally session-local.
         self._filter_group = ""
         self._filter_text = ""
+        self._sort_key = "manual"
+        self._sort_asc = True
 
         self._tray_available = False
         self._quitting = False
@@ -307,6 +311,10 @@ class AppBridge(QObject):
             self.controller.load()
         except Exception as exc:  # pragma: no cover - defensive
             self._notify("error", tr("Ошибка загрузки: {error}", error=exc))
+        saved_settings = self.controller.state.settings
+        self._filter_group = str(saved_settings.node_filter_group or "")
+        self._sort_key = str(saved_settings.node_sort_key or "manual")
+        self._sort_asc = bool(saved_settings.node_sort_ascending)
         self._push_initial_snapshot()
         self._reconfigure_sub_timer()
         self._reconfigure_app_update_timer()
@@ -2717,9 +2725,9 @@ class AppBridge(QObject):
         downloader = UpdateDownloader(
             update,
             proxy_url=proxy_url,
-            restart_in_tray=bool(
-                getattr(self.controller.state.settings, "launch_in_tray_on_startup", True)
-            ),
+            # An update is an interactive internal relaunch. The autostart
+            # preference must not hide the freshly updated application.
+            restart_in_tray=False,
             parent=self,
         )
         self._app_update_downloader = downloader
@@ -3387,6 +3395,14 @@ class AppBridge(QObject):
         """Set the active sort key/direction for the node list and re-push it."""
         self._sort_key = key or "manual"
         self._sort_asc = bool(ascending)
+        settings = self.controller.state.settings
+        if (
+            settings.node_sort_key != self._sort_key
+            or settings.node_sort_ascending != self._sort_asc
+        ):
+            settings.node_sort_key = self._sort_key
+            settings.node_sort_ascending = self._sort_asc
+            self.controller.schedule_save()
         self._apply_node_model()
 
     @pyqtSlot(str, str)
@@ -3395,7 +3411,65 @@ class AppBridge(QObject):
         model holds only visible rows (keeps ListView count/contentHeight correct)."""
         self._filter_group = group or ""
         self._filter_text = text or ""
+        if self.controller.state.settings.node_filter_group != self._filter_group:
+            self.controller.state.settings.node_filter_group = self._filter_group
+            self.controller.schedule_save()
         self._apply_node_model()
+
+    @pyqtProperty(str)
+    def nodeSortKey(self) -> str:
+        return str(self._sort_key or "manual")
+
+    @pyqtProperty(bool)
+    def nodeSortAscending(self) -> bool:
+        return bool(self._sort_asc)
+
+    @pyqtProperty(str)
+    def nodeFilterGroup(self) -> str:
+        return str(self._filter_group or "")
+
+    @pyqtProperty(str)
+    def selectedSubscriptionId(self) -> str:
+        return str(self.controller.state.settings.selected_subscription_id or "")
+
+    @pyqtSlot(str)
+    def setSelectedSubscriptionId(self, subscription_id: str) -> None:
+        value = str(subscription_id or "").strip()
+        settings = self.controller.state.settings
+        if settings.selected_subscription_id == value:
+            return
+        settings.selected_subscription_id = value
+        self.controller.schedule_save()
+
+    @pyqtProperty("QVariantMap")
+    def nodeTableLayout(self) -> dict:
+        return dict(self.controller.state.settings.node_table_layout)
+
+    @pyqtSlot("QVariantMap")
+    def setNodeTableLayout(self, layout: dict) -> None:
+        if not isinstance(layout, dict):
+            return
+        allowed = {
+            "manual", "name", "type", "transport", "address", "port",
+            "group", "ping", "speed", "status", "last",
+        }
+        normalized: dict[str, Any] = {}
+        for key, value in layout.items():
+            key = str(key)
+            if key not in allowed:
+                continue
+            if key == "manual":
+                normalized[key] = bool(value)
+                continue
+            try:
+                normalized[key] = max(48.0, min(float(value), 2000.0))
+            except (TypeError, ValueError):
+                continue
+        settings = self.controller.state.settings
+        if settings.node_table_layout == normalized:
+            return
+        settings.node_table_layout = normalized
+        self.controller.schedule_save()
 
     @pyqtSlot(str, result=bool)
     def createManualGroup(self, name: str) -> bool:

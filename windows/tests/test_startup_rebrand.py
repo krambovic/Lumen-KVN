@@ -86,6 +86,35 @@ def test_development_admin_relaunch_prefers_pythonw_beside_active_interpreter(
     assert executable == pythonw.resolve()
 
 
+def test_internal_relaunch_never_starts_hidden_in_tray() -> None:
+    assert main_qml._should_start_in_tray(["Lumen.exe", "--tray"]) is True
+    assert main_qml._should_start_in_tray(
+        ["Lumen.exe", "--tray", "--relaunched"]
+    ) is False
+    assert main_qml._should_start_in_tray(
+        ["Lumen.exe", "--tray", "--relaunch-as-admin"]
+    ) is False
+
+
+def test_admin_relaunch_drops_autostart_tray_flag(tmp_path: Path, monkeypatch) -> None:
+    executable = tmp_path / "Lumen.exe"
+    executable.write_bytes(b"app")
+    monkeypatch.setattr(startup.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(startup.sys, "executable", str(executable))
+    monkeypatch.setattr(
+        startup.sys,
+        "argv",
+        [str(executable), "--tray", "--relaunched", "lumen://import/test"],
+    )
+
+    _executable, arguments, _working_dir = startup._admin_launch_command()
+
+    assert "--tray" not in arguments
+    assert "--relaunched" not in arguments
+    assert "--relaunch-as-admin" in arguments
+    assert "lumen://import/test" in arguments
+
+
 def test_data_only_legacy_program_files_directory_is_scheduled_for_cleanup(
     tmp_path: Path,
     monkeypatch,

@@ -1,9 +1,11 @@
 ## What's Changed
 
-- feat: added translated descriptions for TLS fragmentation and multiplexing to all desktop UI languages
-- fix: moved VPN recovery after sleep to the Startup and tests settings
-- fix: use one user profile for development and installed desktop launches
-- fix: hardened Windows power-state handling and shutdown lifecycle
-- test: added regression coverage for power resume, shutdown and shared profile paths
+- feat: add protocol-aware ping support for Hysteria, TUIC, AWG, WireGuard, MASQUE, OpenVPN and other native transports
+- fix: allow endpoint, ICMP, HTTP GET and real-ping fallbacks for protocols without an Xray adapter
+- fix: preserve protocol-specific config semantics and route incompatible profiles to the correct core
+- fix: keep custom TUN interface names and restore stable startup, hot-switch and routing behavior
+- fix: make updater and administrator relaunches reopen the desktop window instead of inheriting tray mode
+- fix: persist server ordering, selected groups and related desktop state across restarts
+- test: add regression coverage for native transport ping and restart behavior
 
-Full Changelog: https://github.com/krambovic/Lumen/compare/v1.9.9...v1.9.10
+Full Changelog: https://github.com/krambovic/Lumen/compare/v1.9.10...v1.9.11
