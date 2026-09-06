@@ -79,4 +79,5 @@ desktop.ini
 # Worktrees
 .worktrees/
 AGENTS.md
+HANDOFF.md
 /telemetry-site

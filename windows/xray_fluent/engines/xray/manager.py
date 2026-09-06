@@ -19,6 +19,7 @@ from ...constants import RUNTIME_DIR, XRAY_CONFIG_FILE, XRAY_PATH_DEFAULT
 from ...path_utils import resolve_configured_path
 from ...subprocess_utils import (
     decode_output,
+    is_windows_shutting_down,
     kill_processes_by_path,
     pump_qt_events,
     result_output_text,
@@ -275,7 +276,8 @@ class XrayManager(QObject):
             return True
 
         self._stop_requested = False
-        self.error.emit("Не удалось вовремя остановить процесс Xray")
+        if not is_windows_shutting_down():
+            self.error.emit("Не удалось вовремя остановить процесс Xray")
         return False
 
     def _join_reader(self, timeout: float = 2.0) -> None:
@@ -328,7 +330,7 @@ class XrayManager(QObject):
             if proc is not self._proc:
                 return
             exit_code = proc.returncode if proc.returncode is not None else -1
-            expected = self._stop_requested
+            expected = self._stop_requested or is_windows_shutting_down()
             was_starting = self._starting
             self._last_exit_expected = expected
             self._last_exit_code = exit_code

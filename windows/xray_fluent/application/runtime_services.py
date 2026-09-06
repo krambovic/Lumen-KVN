@@ -121,7 +121,11 @@ def stop_active_connection_processes(controller: AppController, *, disable_proxy
 
 
 def handle_unexpected_disconnect(controller: AppController) -> None:
-    if controller._cleaning_connection_state:
+    if (
+        controller._cleaning_connection_state
+        or getattr(controller, "_shutting_down", False)
+        or getattr(controller, "_system_shutdown", False)
+    ):
         return
     controller._cleaning_connection_state = True
     # Kill-switch: незапланированный обрыв при желании быть на связи → fail-closed (не сбрасываем прокси).
@@ -162,7 +166,11 @@ def on_core_state_changed(controller: AppController, _running: bool) -> None:
         stop_metrics_worker(controller)
         if was_connected and not controller._switching:
             controller.live_metrics_updated.emit({"down_bps": 0.0, "up_bps": 0.0, "latency_ms": None})
-            if not controller._disconnecting:
+            if (
+                not controller._disconnecting
+                and not getattr(controller, "_shutting_down", False)
+                and not getattr(controller, "_system_shutdown", False)
+            ):
                 handle_unexpected_disconnect(controller)
     if (
         not is_connected

@@ -415,6 +415,7 @@ class AppController(QObject):
         self._transition_worker_lock = threading.Lock()
         self._deferred_services_started = False
         self._shutting_down = False
+        self._system_shutdown = False
         self._background_threads: set[threading.Thread] = set()
         self._background_threads_lock = threading.Lock()
         self._save_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="state-save")
@@ -1452,7 +1453,7 @@ class AppController(QObject):
 
     @pyqtSlot(str)
     def _request_transition(self, reason: str) -> None:
-        if self._shutting_down:
+        if self._shutting_down or getattr(self, "_system_shutdown", False):
             return
         if self.thread() != QThread.currentThread():
             self._logger.debug(f"[app] Enqueueing transition from worker thread: {reason}")
@@ -1826,11 +1827,9 @@ class AppController(QObject):
     def request_resume_reconnect(self, reason: str = "system resume") -> bool:
         """Queue a reconnect for a session that was active before system sleep."""
         settings = self.state.settings
-        if self._shutting_down or self.locked:
+        if self._shutting_down or getattr(self, "_system_shutdown", False) or self.locked:
             return False
         if not bool(getattr(settings, "reconnect_after_sleep", True)):
-            return False
-        if not bool(getattr(settings, "reconnect_on_network_change", True)):
             return False
         if not self._desired_connected:
             return False
@@ -2465,6 +2464,7 @@ class AppController(QObject):
             getattr(self, "_disconnecting", False)
             or getattr(self, "_reconnecting", False)
             or getattr(self, "_switching", False)
+            or getattr(self, "_system_shutdown", False)
         )
         suffix = " (expected)" if expected else ""
         self._log(f"[{core}] process stopped with code {exit_code}{suffix}")

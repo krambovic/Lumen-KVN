@@ -386,7 +386,8 @@ class SingBoxManager(QObject):
 
         if proc.poll() is None:
             self._stop_requested = False
-            self.error.emit("failed to stop sing-box process in time")
+            if not is_windows_shutting_down():
+                self.error.emit("failed to stop sing-box process in time")
             return False
 
         # Let sing-box/Wintun perform the normal adapter teardown. Disabling a
@@ -553,7 +554,7 @@ class SingBoxManager(QObject):
                 # A newer process superseded this handle; ignore the stale exit.
                 return
             exit_code = proc.returncode if proc.returncode is not None else -1
-            expected = self._stop_requested
+            expected = self._stop_requested or is_windows_shutting_down()
             was_starting = self._starting
             was_running = self._running
             self._last_exit_code = exit_code

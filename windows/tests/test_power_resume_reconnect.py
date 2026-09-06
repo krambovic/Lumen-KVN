@@ -199,6 +199,26 @@ def test_resume_filter_ignores_resume_without_a_matching_suspend(monkeypatch) ->
         event_filter.close()
 
 
+def test_native_filter_ignores_non_power_messages_with_power_like_wparam(monkeypatch) -> None:
+    app = QCoreApplication.instance() or QCoreApplication([])
+    controller = _controller(connected=True)
+    controller._log = lambda _message: None
+    event_filter = WindowsPowerEventFilter(controller, app)
+    message = power_reconnect._Message()
+    try:
+        monkeypatch.setattr(power_reconnect.sys, "platform", "win32")
+        message.message = 0x0201  # WM_LBUTTONDOWN
+        message.wParam = PBT_APMRESUMEAUTOMATIC
+        event_filter.nativeEventFilter(
+            b"windows_generic_MSG", ctypes.addressof(message)
+        )
+
+        assert event_filter._armed is False
+        assert event_filter._timer.isActive() is False
+    finally:
+        event_filter.close()
+
+
 def test_resume_filter_does_not_reset_an_inflight_recovery(monkeypatch) -> None:
     app = QCoreApplication.instance() or QCoreApplication([])
     controller = _controller(connected=True)
@@ -245,6 +265,10 @@ def test_native_shutdown_message_marks_controller_before_core_exit(monkeypatch) 
     app = QCoreApplication.instance() or QCoreApplication([])
     controller = _controller(connected=True)
     controller._system_shutdown = False
+    stopped: list[tuple[bool, bool]] = []
+    controller._stop_active_connection_processes = lambda **kwargs: stopped.append(
+        (kwargs["disable_proxy"], kwargs["fast"])
+    ) or True
     controller._log = lambda _message: None
     event_filter = WindowsPowerEventFilter(controller, app)
     shutdown_message = power_reconnect._Message()
@@ -256,6 +280,7 @@ def test_native_shutdown_message_marks_controller_before_core_exit(monkeypatch) 
             b"windows_generic_MSG", ctypes.addressof(shutdown_message)
         )
         assert controller._system_shutdown is True
+        assert stopped == []
         assert event_filter._armed is False
         assert event_filter._timer.isActive() is False
 
@@ -266,6 +291,33 @@ def test_native_shutdown_message_marks_controller_before_core_exit(monkeypatch) 
             b"windows_generic_MSG", ctypes.addressof(shutdown_message)
         )
         assert controller._system_shutdown is True
+        assert stopped == [(True, True)]
+    finally:
+        event_filter.close()
+
+
+def test_native_shutdown_cancel_restores_normal_controller_state(monkeypatch) -> None:
+    app = QCoreApplication.instance() or QCoreApplication([])
+    controller = _controller(connected=True)
+    controller._system_shutdown = False
+    controller._log = lambda _message: None
+    event_filter = WindowsPowerEventFilter(controller, app)
+    message = power_reconnect._Message()
+    try:
+        monkeypatch.setattr(power_reconnect.sys, "platform", "win32")
+        message.message = WM_QUERYENDSESSION
+        event_filter.nativeEventFilter(
+            b"windows_generic_MSG", ctypes.addressof(message)
+        )
+        assert controller._system_shutdown is True
+
+        message.message = WM_ENDSESSION
+        message.wParam = 0
+        event_filter.nativeEventFilter(
+            b"windows_generic_MSG", ctypes.addressof(message)
+        )
+        assert controller._system_shutdown is False
+        assert controller._desired_connected is True
     finally:
         event_filter.close()
 
