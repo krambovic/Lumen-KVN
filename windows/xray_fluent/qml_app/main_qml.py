@@ -640,12 +640,16 @@ def _create_single_instance(app, launch_arguments=None):
 
 def _activate_window(window) -> None:
     hwnd = 0
+    reveal = getattr(window, "_lumen_reveal", None)
     try:
-        window.setVisible(True)
-        window.showNormal()
-        window.show()
-        window.raise_()
-        window.requestActivate()
+        if callable(reveal):
+            reveal()
+        else:
+            window.setVisible(True)
+            window.showNormal()
+            window.show()
+            window.raise_()
+            window.requestActivate()
     except Exception:
         pass
     if sys.platform != "win32":
@@ -843,13 +847,14 @@ def main(argv: list[str] | None = None) -> int:
     _enable_gpu_friendly_defaults()
     _install_message_filter()
 
-    from PyQt6.QtCore import QMetaObject, QTimer, QUrl
+    from PyQt6.QtCore import QMetaObject, QTimer, QUrl, Qt
     from PyQt6.QtGui import QIcon
     from PyQt6.QtQml import QQmlApplicationEngine, qmlRegisterSingletonInstance
     from PyQt6.QtWidgets import QApplication
 
     from ..constants import APP_ICON_PATH, APP_NAME
     from .bridge import AppBridge
+    from .window_reveal import WindowReveal
 
     QApplication.setApplicationName(APP_NAME)
 
@@ -894,6 +899,7 @@ def main(argv: list[str] | None = None) -> int:
     window = engine.rootObjects()[0]
     _attach_qwindowkit(window)
     _refresh_custom_frame(window)
+    reveal = WindowReveal(window, lambda callback: QTimer.singleShot(0, callback))
     # QWindowKit updates Qt's non-client-area geometry.  Restore the saved
     # size and install minimum constraints only after that setup is complete;
     # applying them while QML is still loading can leave a DPI-scaled blank
@@ -959,46 +965,31 @@ def main(argv: list[str] | None = None) -> int:
         _refresh_custom_frame(window)
         _apply_mica(window, _resolve_dark(app, _theme_name(bridge)), bridge.uiBackdrop)
 
+    def _apply_backdrop_only() -> None:
+        _apply_mica(window, _resolve_dark(app, _theme_name(bridge)), bridge.uiBackdrop)
+
     def _schedule_backdrop_refresh(*_args) -> None:
-        QTimer.singleShot(0, _refresh_backdrop)
-        QTimer.singleShot(150, _refresh_backdrop)
+        QTimer.singleShot(0, _apply_backdrop_only)
+        QTimer.singleShot(150, _apply_backdrop_only)
 
-    _recomposited = {"done": False}
-
-    def _force_recomposite() -> None:
-        try:
-            w = window.width()
-            h = window.height()
-            window.setWidth(w + 1)
-            window.setHeight(h + 1)
-
-            def _revert() -> None:
-                try:
-                    window.setWidth(w)
-                    window.setHeight(h)
-                except Exception:
-                    pass
-                _refresh_backdrop()
-
-            QTimer.singleShot(50, _revert)
-        except Exception:
-            pass
-        _refresh_backdrop()
+    first_frame = {"done": False}
 
     def _on_first_frame() -> None:
-        if _recomposited["done"]:
+        reveal.frame_swapped()
+        if first_frame["done"]:
             return
-        _recomposited["done"] = True
+        first_frame["done"] = True
         QTimer.singleShot(0, bridge.startDeferred)
         QTimer.singleShot(250, lambda: QMetaObject.invokeMethod(window, "beginBackgroundPageWarmup"))
-        QTimer.singleShot(0, _force_recomposite)
 
     _refresh_backdrop()
     try:
-        window.frameSwapped.connect(_on_first_frame)
+        window.frameSwapped.connect(
+            _on_first_frame,
+            Qt.ConnectionType.QueuedConnection,
+        )
     except Exception:
-        QTimer.singleShot(0, _force_recomposite)
-        QTimer.singleShot(200, _force_recomposite)
+        QTimer.singleShot(0, bridge.startDeferred)
     QTimer.singleShot(750, bridge.startDeferred)
     QTimer.singleShot(1200, lambda: QMetaObject.invokeMethod(window, "beginBackgroundPageWarmup"))
     try:
@@ -1012,17 +1003,24 @@ def main(argv: list[str] | None = None) -> int:
                 signal.connect(_schedule_backdrop_refresh)
             except Exception:
                 pass
-
     from PyQt6.QtWidgets import QSystemTrayIcon
     from .tray import QmlTray
 
     tray_available = QSystemTrayIcon.isSystemTrayAvailable()
     bridge.set_tray_available(tray_available)
     app.setQuitOnLastWindowClosed(not tray_available)
-    tray = QmlTray(app, window, bridge) if tray_available else None
-    window.setVisible(not (start_in_tray and tray_available))
-    QTimer.singleShot(0, lambda: _refresh_custom_frame(window))
-    QTimer.singleShot(200, lambda: _refresh_custom_frame(window))
+    def _request_reveal(*, activate: bool = False) -> None:
+        reveal.request(activate=activate)
+        QTimer.singleShot(500, reveal.reveal_if_pending)
+
+    window._lumen_reveal = lambda: _request_reveal(activate=True)
+    tray = (
+        QmlTray(app, window, bridge, show_window=lambda: _request_reveal(activate=True))
+        if tray_available
+        else None
+    )
+    if not (start_in_tray and tray_available):
+        _request_reveal()
     try:
         app.commitDataRequest.connect(lambda _manager: bridge.prepareSystemShutdown())
     except Exception:

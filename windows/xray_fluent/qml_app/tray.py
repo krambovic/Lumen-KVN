@@ -13,11 +13,12 @@ from .toast import show_toast
 class QmlTray(QObject):
     """Owns the QSystemTrayIcon and bridges it to the window + AppBridge."""
 
-    def __init__(self, app, window, bridge) -> None:
+    def __init__(self, app, window, bridge, show_window=None) -> None:
         super().__init__(window)
         self._app = app
         self._window = window
         self._bridge = bridge
+        self._show_window_callback = show_window
         self._notified = False
         self._routing_actions: list[QAction] = []
 
@@ -102,9 +103,12 @@ class QmlTray(QObject):
 
     def _show_window(self) -> None:
         try:
-            self._window.show()
-            self._window.raise_()
-            self._window.requestActivate()
+            if self._show_window_callback is not None:
+                self._show_window_callback()
+            else:
+                self._window.show()
+                self._window.raise_()
+                self._window.requestActivate()
         except Exception:
             pass
         self._refresh_actions()
