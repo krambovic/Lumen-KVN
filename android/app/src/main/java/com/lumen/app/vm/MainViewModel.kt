@@ -173,6 +173,10 @@ internal fun geoRegionCode(source: String): String {
     }
 }
 
+/** Only a completed persisted result can trigger destructive ping cleanup. */
+internal fun isPingRemovalCandidate(pingMs: Int?, thresholdMs: Int): Boolean =
+    pingMs != null && pingMs >= 0 && pingMs <= thresholdMs.coerceAtLeast(0)
+
 /**
  * The selected region is the only regional pair in the new set. Regional rules left
  * by the previous automatic preset are deliberately ignored before downloads begin.
@@ -229,8 +233,26 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     internal val androidUpdateState: StateFlow<AndroidUpdateState> = _androidUpdateState
 
     internal fun checkForAndroidUpdate(force: Boolean = false) {
+        if (!force) {
+            if (!_settings.value.autoCheckUpdates) return
+            val now = System.currentTimeMillis()
+            val last = prefs.getLong(PREF_LAST_ANDROID_UPDATE_CHECK, 0L)
+            if (!AndroidUpdateChecker.isAutoCheckDue(now, last)) return
+        }
+        checkForAndroidUpdateInternal(force = force, userInitiated = force)
+    }
+
+    /** Called when the activity returns to the foreground; the check itself is daily. */
+    internal fun checkForAndroidUpdateIfDue() {
+        checkForAndroidUpdate(force = false)
+    }
+
+    private fun checkForAndroidUpdateInternal(force: Boolean, userInitiated: Boolean) {
         val current = _androidUpdateState.value
-        if (current.isChecking || (!force && current.checked)) return
+        if (current.isChecking || (!force && !_settings.value.autoCheckUpdates)) return
+        prefs.edit()
+            .putLong(PREF_LAST_ANDROID_UPDATE_CHECK, System.currentTimeMillis())
+            .apply()
         _androidUpdateState.value = current.copy(isChecking = true, error = null)
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
@@ -248,7 +270,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }.onFailure { error ->
                 _androidUpdateState.value = AndroidUpdateState(
                     isChecking = false,
-                    error = error.message ?: "Could not check GitHub releases",
+                    error = if (userInitiated) {
+                        error.message ?: "Could not check GitHub releases"
+                    } else {
+                        null
+                    },
                     checked = true
                 )
                 VpnLogBus.warning("UPDATE", "Android update check failed: ${error.message}")
@@ -628,6 +654,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         pingGoodMs = prefs.getInt("ping_good_ms", 150),
         pingFairMs = prefs.getInt("ping_fair_ms", 300),
         pingAutoOnOpen = prefs.getBoolean("ping_auto_on_open", false),
+        pingAutoDeleteUnreachable = prefs.getBoolean("ping_auto_delete_unreachable", false),
+        pingAutoDeleteThresholdMs = prefs.getInt("ping_auto_delete_threshold_ms", 1)
+            .coerceIn(0, 100),
+        autoCheckUpdates = prefs.getBoolean("auto_check_updates", true),
         dashboardStyle = runCatching {
             DashboardStyle.valueOf(prefs.getString("dashboard_style", DashboardStyle.DEFAULT.name) ?: DashboardStyle.DEFAULT.name)
         }.getOrDefault(DashboardStyle.DEFAULT),
@@ -650,6 +680,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun updateSettings(s: SettingsUiState) {
         val telemetryChanged = _settings.value.telemetryEnabled != s.telemetryEnabled
         val launcherIconChanged = _settings.value.launcherIcon != s.launcherIcon
+        val autoUpdatesEnabled = !_settings.value.autoCheckUpdates && s.autoCheckUpdates
         _settings.value = s
         prefs.edit()
             .putString("engine_type", s.engine)
@@ -749,6 +780,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             .putInt("ping_good_ms", s.pingGoodMs.coerceIn(10, 2000))
             .putInt("ping_fair_ms", s.pingFairMs.coerceIn(20, 5000))
             .putBoolean("ping_auto_on_open", s.pingAutoOnOpen)
+            .putBoolean("ping_auto_delete_unreachable", s.pingAutoDeleteUnreachable)
+            .putInt("ping_auto_delete_threshold_ms", s.pingAutoDeleteThresholdMs.coerceIn(0, 100))
+            .putBoolean("auto_check_updates", s.autoCheckUpdates)
             .putString("dashboard_style", s.dashboardStyle.name)
             .putString(PREF_LAUNCHER_ICON, s.launcherIcon.name)
             .apply()
@@ -760,6 +794,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching { LauncherIconManager.applyOption(getApplication<Application>(), wanted) }
             }
         }
+        if (autoUpdatesEnabled) checkForAndroidUpdate(force = true)
         // The log settings live in the bus under its own keys. Only the master switch
         // is user facing now; verbosity and retention keep their stored defaults so
         // turning logging back on restores the behaviour it had before.
@@ -2182,6 +2217,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 _pingingNodeIds.value = targetIds.toSet()
                 nodeDao.updatePingsBatch(targetIds.map { Pair(it, null as Int?) })
                 val pending = java.util.Collections.synchronizedSet(targetIds.toMutableSet())
+                val completedPings = java.util.Collections.synchronizedMap(mutableMapOf<String, Int>())
                 val semaphore = kotlinx.coroutines.sync.Semaphore(limit)
                 val jobs = targets.map { node ->
                     async {
@@ -2189,13 +2225,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                             semaphore.withPermit {
                                 // Repeats the probe and aggregates it per the ping settings.
                                 val ping = measureNodePing(node)
-                                nodeDao.updatePing(node.id, ping.coerceAtLeast(0))
+                                val persistedPing = ping.coerceAtLeast(0)
+                                nodeDao.updatePing(node.id, persistedPing)
+                                completedPings[node.id] = persistedPing
                             }
                         } catch (e: kotlinx.coroutines.CancellationException) {
                             throw e
                         } catch (e: Exception) {
                             // One failing node must not abort the run for all the others.
-                            runCatching { nodeDao.updatePing(node.id, 0) }
+                            runCatching {
+                                nodeDao.updatePing(node.id, 0)
+                                completedPings[node.id] = 0
+                            }
                             log("Ping failed for ${node.name}: ${e.message}")
                         } finally {
                             // Runs on the cancellation path too, so no row stays measuring.
@@ -2218,6 +2259,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     val leftovers = synchronized(pending) { pending.toList() }
                     runCatching { nodeDao.updatePingsBatch(leftovers.map { Pair(it, 0 as Int?) }) }
                     log("Ping deadline reached: ${leftovers.size} node(s) marked unreachable")
+                }
+                if (finished && cfg.pingAutoDeleteUnreachable) {
+                    val removed = removeUnhealthyNodesAfterPing(
+                        completedPings = completedPings.toMap(),
+                        thresholdMs = cfg.pingAutoDeleteThresholdMs
+                    )
+                    if (removed > 0) log("Auto-removed $removed node(s) after the ping test")
                 }
                 log("Ping finished for ${targets.size} node(s)")
             } finally {
@@ -2246,10 +2294,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 // Same repeat/aggregate rules as the bulk check.
                 val entity = nodeEntities.value.firstOrNull { it.id == node.id }
                 val ping = entity?.let { measureNodePing(it) } ?: -1
-                nodeDao.updatePing(node.id, ping.coerceAtLeast(0))
+                val persistedPing = ping.coerceAtLeast(0)
+                nodeDao.updatePing(node.id, persistedPing)
                 val result = if (ping > 0) "$ping ms" else "0"
                 _serverTestResults.update { it + (node.id to result) }
                 log("Ping ${node.name}: $result")
+                if (
+                    _settings.value.pingAutoDeleteUnreachable &&
+                    isPingRemovalCandidate(persistedPing, _settings.value.pingAutoDeleteThresholdMs)
+                ) {
+                    val removed = removeUnhealthyNodesAfterPing(
+                        completedPings = mapOf(node.id to persistedPing),
+                        thresholdMs = _settings.value.pingAutoDeleteThresholdMs
+                    )
+                    if (removed > 0) log("Auto-removed ${node.name} after the ping test")
+                }
             } finally {
                 // A thrown or cancelled measurement must not leave the row spinning.
                 _pingingNodeIds.update { it - node.id }
@@ -2436,6 +2495,47 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 .minOrNull()
                 ?: -1
         }
+    }
+
+    /**
+     * Deletes only rows whose just-completed result is still present in Room. A timed-out
+     * batch never calls this method, and a result that changed during the test is retained.
+     * The selected live tunnel is protected so cleanup cannot interrupt a connection.
+     */
+    private suspend fun removeUnhealthyNodesAfterPing(
+        completedPings: Map<String, Int>,
+        thresholdMs: Int
+    ): Int {
+        val candidateIds = completedPings
+            .filter { (id, _) ->
+                id != _selectedNodeId.value ||
+                    (!LumenVpnService.isRunning.value && !LumenVpnService.isStarting.value)
+            }
+            .filter { (_, ping) -> isPingRemovalCandidate(ping, thresholdMs) }
+            .keys
+            .toList()
+        if (candidateIds.isEmpty()) return 0
+
+        val confirmed = nodeDao.getNodesByIds(candidateIds).filter { node ->
+            completedPings[node.id] == node.pingMs &&
+                isPingRemovalCandidate(node.pingMs, thresholdMs)
+        }
+        if (confirmed.isEmpty()) return 0
+
+        val keys = confirmed.map { it.groupKey() }
+        confirmed.forEach { nodeDao.deleteNodeById(it.id) }
+        if (keys.isNotEmpty()) serverGroupDao.assignNodes(keys, null)
+
+        if (_selectedNodeId.value in confirmed.map { it.id }) {
+            _selectedNodeId.value = null
+            prefs.edit()
+                .remove("selected_node_id")
+                .remove("selected_node_name")
+                .remove("selected_node_name_b64")
+                .apply()
+            com.lumen.app.widget.LumenWidgetProvider.sendUpdateBroadcast(getApplication())
+        }
+        return confirmed.size
     }
 
     /**
@@ -3533,6 +3633,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         private const val STORED_CONFIG_REFRESH_DEBOUNCE_MS = 400L
         private const val STORED_CONFIG_RUNNING_RETRY_MS = 250L
         private const val GEO_RESOURCE_MAX_BYTES = 256L * 1024 * 1024
+        private const val PREF_LAST_ANDROID_UPDATE_CHECK = "last_android_update_check_ms"
         /** Last known subscription-userinfo figures, one `id|upload|download|total|expire` line each. */
         private const val KEY_SUBSCRIPTION_USAGE = "subscription_usage"
         private val USAGE_KEYS = listOf("upload", "download", "total", "expire")

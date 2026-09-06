@@ -250,6 +250,10 @@ def connect_selected(controller: AppController, allow_during_reconnect: bool = F
             core=controller._active_core,
             api_port=controller._xray_api_port,
             clash_api_secret=singbox_plan.clash_api_secret if singbox_plan is not None else "",
+            clash_api_selector=singbox_plan.clash_api_selector if singbox_plan is not None else "",
+            clash_api_node_signatures=(
+                singbox_plan.clash_api_node_signatures if singbox_plan is not None else ()
+            ),
             hybrid=bool(singbox_plan is not None and singbox_plan.is_hybrid),
             socks_port=runtime_xray.socks_port if runtime_xray is not None else None,
             http_port=runtime_xray.http_port if runtime_xray is not None else None,

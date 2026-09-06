@@ -120,6 +120,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        viewModel.checkForAndroidUpdateIfDue()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         // Without this getIntent() keeps returning the launch intent, so a language

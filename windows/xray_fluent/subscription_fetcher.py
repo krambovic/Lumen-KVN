@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Callable
@@ -90,7 +91,33 @@ def _read_http_response(response: object, max_bytes: int) -> tuple[bytes, dict[s
         status = int(getattr(response, "status", 0) or 0)
     except (TypeError, ValueError):
         status = 0
+    if not status:
+        try:
+            status = int(response.getcode() or 0)
+        except (AttributeError, TypeError, ValueError):
+            status = 0
     return bytes(payload), raw_headers, status
+
+
+def _not_modified_http_error(exc: urllib.error.HTTPError, transport: str) -> SubscriptionHttpPayload:
+    """Convert urllib's optional HTTPError(304) path into a normal payload."""
+    if int(getattr(exc, "code", 0) or 0) != 304:
+        raise exc
+    headers: dict[str, str] = {}
+    try:
+        for key, value in exc.headers.items():
+            normalized = str(key or "").strip().lower()
+            if normalized:
+                headers[normalized] = str(value or "").strip()
+    except (AttributeError, TypeError):
+        pass
+    try:
+        effective_url = str(exc.geturl() or "").strip()
+    except (AttributeError, TypeError, ValueError):
+        effective_url = ""
+    if effective_url:
+        headers["x-lumen-effective-url"] = effective_url
+    return SubscriptionHttpPayload(b"", headers, 304, transport)
 
 
 def _download_in_current_process(
@@ -106,14 +133,17 @@ def _download_in_current_process(
     request = urllib.request.Request(url, headers=dict(headers))
     try:
         with DirectUrlOpener() as opener:
-            with opener.open(request, timeout=timeout) as response:
-                if response_opened is not None:
-                    response_opened(response)
-                try:
-                    body, response_headers, status = _read_http_response(response, max_bytes)
-                finally:
-                    if response_closed is not None:
-                        response_closed(response)
+            try:
+                with opener.open(request, timeout=timeout) as response:
+                    if response_opened is not None:
+                        response_opened(response)
+                    try:
+                        body, response_headers, status = _read_http_response(response, max_bytes)
+                    finally:
+                        if response_closed is not None:
+                            response_closed(response)
+            except urllib.error.HTTPError as exc:
+                return _not_modified_http_error(exc, "direct-route")
         return SubscriptionHttpPayload(body, response_headers, status, "direct-route")
     except DirectNetworkUnavailable:
         if not allow_process_direct_fallback:
@@ -126,14 +156,17 @@ def _download_in_current_process(
             urllib.request.ProxyHandler({}),
             urllib.request.HTTPSHandler(context=get_ssl_context()),
         )
-        with opener.open(request, timeout=timeout) as response:
-            if response_opened is not None:
-                response_opened(response)
-            try:
-                body, response_headers, status = _read_http_response(response, max_bytes)
-            finally:
-                if response_closed is not None:
-                    response_closed(response)
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                if response_opened is not None:
+                    response_opened(response)
+                try:
+                    body, response_headers, status = _read_http_response(response, max_bytes)
+                finally:
+                    if response_closed is not None:
+                        response_closed(response)
+        except urllib.error.HTTPError as exc:
+            return _not_modified_http_error(exc, "process-direct")
         return SubscriptionHttpPayload(body, response_headers, status, "process-direct")
 
 
@@ -158,19 +191,22 @@ def _download_via_proxy_or_tun(
             )
         )
     handlers.append(urllib.request.HTTPSHandler(context=get_ssl_context()))
+    transport = "lumen-proxy" if normalized_proxy else "system-proxy-tun"
     opener = urllib.request.build_opener(*handlers)
     try:
-        with opener.open(request, timeout=timeout) as response:
-            if response_opened is not None:
-                response_opened(response)
-            try:
-                body, response_headers, status = _read_http_response(response, max_bytes)
-            finally:
-                if response_closed is not None:
-                    response_closed(response)
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                if response_opened is not None:
+                    response_opened(response)
+                try:
+                    body, response_headers, status = _read_http_response(response, max_bytes)
+                finally:
+                    if response_closed is not None:
+                        response_closed(response)
+        except urllib.error.HTTPError as exc:
+            return _not_modified_http_error(exc, transport)
     finally:
         opener.close()
-    transport = "lumen-proxy" if normalized_proxy else "system-proxy-tun"
     return SubscriptionHttpPayload(body, response_headers, status, transport)
 
 

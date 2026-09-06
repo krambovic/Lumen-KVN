@@ -93,6 +93,14 @@ def test_settings_tabs_switch_directly_without_swiping_intermediate_pages() -> N
     assert settings_qml.count("ParallelAnimation {") >= 2
 
 
+def test_startup_settings_expose_always_run_as_admin() -> None:
+    settings_qml = (QML_DIR / "SettingsPage.qml").read_text(encoding="utf-8")
+
+    assert 'title: I18n.t("Всегда запускать от администратора")' in settings_qml
+    assert 'checked: App.alwaysRunAsAdmin' in settings_qml
+    assert 'onToggled: App.setAlwaysRunAsAdmin(checked)' in settings_qml
+
+
 def test_compact_settings_mode_hides_advanced_controls_not_data_tools() -> None:
     settings_qml = (QML_DIR / "SettingsPage.qml").read_text(encoding="utf-8")
 

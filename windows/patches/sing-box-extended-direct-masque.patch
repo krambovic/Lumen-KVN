@@ -1,45 +1,30 @@
 diff --git a/option/masque.go b/option/masque.go
-index 65053d1..f18afb6 100644
+index 94c7048..8a7af3e 100644
 --- a/option/masque.go
 +++ b/option/masque.go
-@@ -10,6 +10,12 @@ type MASQUEOutboundOptions struct {
- 	DialerOptions
- 	System               bool                             `json:"system,omitempty"`
- 	Name                 string                           `json:"name,omitempty"`
+@@ -12,0 +13,6 @@ type MASQUEOutboundOptions struct {
 +	Server               string                           `json:"server,omitempty"`
 +	ServerPort           uint16                           `json:"server_port,omitempty"`
 +	PrivateKey           string                           `json:"private_key,omitempty"`
 +	PublicKey            string                           `json:"public_key,omitempty"`
-+	Address              badoption.Listable[netip.Prefix] `json:"address,omitempty"`
++	TunnelAddress        badoption.Listable[netip.Prefix] `json:"tunnel_address,omitempty"`
 +	MTU                  uint32                           `json:"mtu,omitempty"`
- 	AllowedIPs           badoption.Listable[netip.Prefix] `json:"allowed_ips,omitempty"`
- 	UseHTTP2             bool                             `json:"use_http2,omitempty"`
- 	UseIPv6              bool                             `json:"use_ipv6,omitempty"`
 diff --git a/protocol/masque/config.go b/protocol/masque/config.go
 index f1242f6..6c524e0 100644
 --- a/protocol/masque/config.go
 +++ b/protocol/masque/config.go
-@@ -38,7 +38,11 @@ func (c *Config) GetEcPrivateKey() (*ecdsa.PrivateKey, error) {
- func (c *Config) GetEcEndpointPublicKey() (*ecdsa.PublicKey, error) {
- 	endpointPubKeyB64, _ := pem.Decode([]byte(c.EndpointPubKey))
- 	if endpointPubKeyB64 == nil {
+@@ -41 +41,5 @@ func (c *Config) GetEcEndpointPublicKey() (*ecdsa.PublicKey, error) {
 -		return nil, fmt.Errorf("failed to decode endpoint public key")
 +		derBytes, err := base64.StdEncoding.DecodeString(c.EndpointPubKey)
 +		if err != nil {
 +			return nil, fmt.Errorf("failed to decode endpoint public key: %v", err)
 +		}
 +		endpointPubKeyB64 = &pem.Block{Type: "PUBLIC KEY", Bytes: derBytes}
- 	}
- 
- 	pubKey, err := x509.ParsePKIXPublicKey(endpointPubKeyB64.Bytes)
 diff --git a/protocol/masque/outbound.go b/protocol/masque/outbound.go
-index e47ffa6..4205332 100644
+index fe80cb4..e553abd 100644
 --- a/protocol/masque/outbound.go
 +++ b/protocol/masque/outbound.go
-@@ -59,7 +59,13 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
- 		cacheFile := service.FromContext[adapter.CacheFile](ctx)
- 		var appConfig *Config
- 		var err error
+@@ -62 +62,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 -		if !options.Profile.Recreate && cacheFile != nil && cacheFile.StoreMASQUEConfig() {
 +		if options.Server != "" || options.PrivateKey != "" || options.PublicKey != "" {
 +			appConfig, err = outbound.createDirectConfig()
@@ -48,58 +33,37 @@ index e47ffa6..4205332 100644
 +				return
 +			}
 +		} else if !options.Profile.Recreate && cacheFile != nil && cacheFile.StoreMASQUEConfig() {
- 			savedProfile := cacheFile.LoadMASQUEConfig(tag)
- 			if savedProfile != nil {
- 				if err = json.Unmarshal(savedProfile.Content, &appConfig); err != nil {
-@@ -111,7 +117,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
- 			logger.ErrorContext(ctx, E.New("failed to prepare TLS config: ", err))
- 			return
- 		}
--		endpoint, err := appConfig.SelectEndpointFromConfig(options.UseHTTP2, options.UseIPv6, 443)
-+		serverPort := int(options.ServerPort)
-+		if serverPort == 0 {
-+			serverPort = 443
-+		}
-+		endpoint, err := appConfig.SelectEndpointFromConfig(options.UseHTTP2, options.UseIPv6, serverPort)
- 		if err != nil {
- 			logger.ErrorContext(ctx, E.New("failed to select endpoint: ", err))
- 			return
-@@ -147,6 +157,17 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
- 			logger.ErrorContext(ctx, err)
- 			return
- 		}
+@@ -131 +137,5 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+-			endpoint, err = appConfig.SelectEndpointFromConfig(options.UseHTTP2, options.UseIPv6, 443)
++			serverPort := int(options.ServerPort)
++			if serverPort == 0 {
++				serverPort = 443
++			}
++			endpoint, err = appConfig.SelectEndpointFromConfig(options.UseHTTP2, options.UseIPv6, serverPort)
+@@ -158,0 +169,16 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 +		tunnelAddress := make([]netip.Prefix, 0, 2)
-+		if appConfig.IPv4 != "" {
-+			tunnelAddress = append(tunnelAddress, netip.MustParsePrefix(appConfig.IPv4+"/32"))
++		for _, prefix := range options.TunnelAddress {
++			tunnelAddress = append(tunnelAddress, prefix)
 +		}
-+		if appConfig.IPv6 != "" {
-+			tunnelAddress = append(tunnelAddress, netip.MustParsePrefix(appConfig.IPv6+"/128"))
++		if len(tunnelAddress) == 0 {
++			if appConfig.IPv4 != "" {
++				tunnelAddress = append(tunnelAddress, netip.MustParsePrefix(appConfig.IPv4+"/32"))
++			}
++			if appConfig.IPv6 != "" {
++				tunnelAddress = append(tunnelAddress, netip.MustParsePrefix(appConfig.IPv6+"/128"))
++			}
 +		}
 +		if len(tunnelAddress) == 0 {
 +			logger.ErrorContext(ctx, E.New("MASQUE profile contains no tunnel address"))
 +			return
 +		}
- 		tunnel, err := masque.NewTunnel(
- 			ctx,
- 			logger,
-@@ -158,11 +179,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
- 						BindInterface: interfaceName,
- 					}))
- 				},
--				Dialer: outboundDialer,
+@@ -182,4 +208 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 -				Address: []netip.Prefix{
 -					netip.MustParsePrefix(appConfig.IPv4 + "/32"),
 -					netip.MustParsePrefix(appConfig.IPv6 + "/128"),
 -				},
-+				Dialer:               outboundDialer,
 +				Address:              tunnelAddress,
- 				AllowedAddress:       options.AllowedIPs,
- 				Endpoint:             endpoint,
- 				TLSConfig:            tlsConfig,
-@@ -324,3 +342,35 @@ func (w *Outbound) createConfig() (*Config, error) {
- 		IPv6:           updatedProfile.Config.Interface.Addresses.V6,
- 	}, nil
- }
+@@ -351,0 +375,32 @@ func (w *Outbound) createConfig() (*Config, error) {
 +
 +func (w *Outbound) createDirectConfig() (*Config, error) {
 +	if w.options.Server == "" || w.options.PrivateKey == "" || w.options.PublicKey == "" {
@@ -115,7 +79,7 @@ index e47ffa6..4205332 100644
 +		EndpointH2V4:   server,
 +		EndpointPubKey: w.options.PublicKey,
 +	}
-+	for _, prefix := range w.options.Address {
++	for _, prefix := range w.options.TunnelAddress {
 +		address := prefix.Addr().Unmap()
 +		if address.Is4() {
 +			config.IPv4 = address.String()

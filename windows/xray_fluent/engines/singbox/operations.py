@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from .runtime_planner import SingboxRuntimePlan
+from .clash_api import ClashApiError, SingboxClashApiClient
+from .runtime_planner import SingboxRuntimePlan, singbox_node_source_signature, singbox_node_tag
 
 if TYPE_CHECKING:
     from ...app_controller import AppController
@@ -146,6 +147,72 @@ def start_proxy(
     return start_runtime(controller, node, prev_active_core=prev_active_core, tun_mode=False)
 
 
+def try_hot_switch_selector(controller: AppController, reason: str) -> bool:
+    """Switch a native sing-box selector without restarting its runtime."""
+    session = controller._active_session
+    node = controller.selected_node
+    if (
+        session is None
+        or node is None
+        or session.active_core != "singbox"
+        or not session.tun_mode
+        or getattr(session, "node_id", None) == node.id
+        or session.hybrid
+        or not session.clash_api_selector
+        or not session.clash_api_secret
+    ):
+        return False
+
+    node_signatures = dict(getattr(session, "clash_api_node_signatures", ()) or ())
+    if not node_signatures:
+        return False
+    if node_signatures.get(node.id) != singbox_node_source_signature(node):
+        controller._log("[clash-api] selected node is not present in the active runtime mapping")
+        return False
+
+    target = singbox_node_tag(node.id)
+    client = SingboxClashApiClient(secret=session.clash_api_secret)
+    try:
+        result = client.switch_selector(session.clash_api_selector, target)
+    except ClashApiError as exc:
+        controller._log(f"[clash-api] selector switch unavailable; using restart fallback: {exc}")
+        return False
+
+    controller._log(
+        f"[clash-api] switched selector={result.selector} "
+        f"{result.previous} -> {result.current}; reason={reason}"
+    )
+    controller._metrics_request.emit(False)
+    node.last_used_at = datetime.now(timezone.utc).isoformat()
+    ping_host, ping_port = controller._infer_singbox_ping_target(
+        {"outbounds": [{"tag": "proxy", "type": "selector"}]},
+        node,
+    )
+    controller._capture_active_session(
+        node,
+        tun=True,
+        core="singbox",
+        api_port=session.api_port,
+        clash_api_secret=session.clash_api_secret,
+        clash_api_selector=session.clash_api_selector,
+        clash_api_node_signatures=session.clash_api_node_signatures,
+        hybrid=False,
+        socks_port=session.socks_port,
+        http_port=session.http_port,
+        xray_inbound_tags=session.xray_inbound_tags,
+        sidecar_relay_port=0,
+        protect_ss_port=0,
+        protect_ss_password="",
+        ping_host=ping_host,
+        ping_port=ping_port,
+    )
+    label = node.name or node.server
+    controller._set_connection_status("running", f"Переключено: {label} (TUN)", level="success")
+    controller.save()
+    controller._metrics_request.emit(True)
+    return True
+
+
 def restart_runtime(controller: AppController, reason: str) -> bool:
     node = controller.selected_node
     controller._switching = True
@@ -233,6 +300,8 @@ def restart_runtime(controller: AppController, reason: str) -> bool:
             core="singbox",
             api_port=0,
             clash_api_secret=plan.clash_api_secret,
+            clash_api_selector=plan.clash_api_selector,
+            clash_api_node_signatures=plan.clash_api_node_signatures,
             hybrid=plan.is_hybrid,
             xray_inbound_tags=(),
             sidecar_relay_port=plan.xray_sidecar.relay_port if plan.xray_sidecar else 0,

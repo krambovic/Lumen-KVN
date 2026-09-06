@@ -72,3 +72,42 @@ def test_dropped_file_is_highlighted_without_changing_active_node(tmp_path) -> N
     assert controller.state.selected_node_id == "active"
     assert imported_signal.calls == [("imported",)]
     assert toast_signal.calls[0][0] == "success"
+
+
+def test_clipboard_file_urls_are_imported_as_config_files(monkeypatch, tmp_path) -> None:
+    first = tmp_path / "awg3-first.conf"
+    second = tmp_path / "awg3-second.conf"
+    first.write_text("[Interface]\n", encoding="utf-8")
+    second.write_text("[Interface]\n", encoding="utf-8")
+    urls = [QUrl.fromLocalFile(str(first)), QUrl.fromLocalFile(str(second))]
+
+    class _MimeData:
+        def hasUrls(self) -> bool:
+            return True
+
+        def urls(self) -> list[QUrl]:
+            return urls
+
+    class _Clipboard:
+        def mimeData(self) -> _MimeData:
+            return _MimeData()
+
+        def text(self) -> str:
+            return "\n".join(url.toString() for url in urls)
+
+    import xray_fluent.qml_app.bridge.app_bridge as app_bridge_module
+
+    monkeypatch.setattr(
+        app_bridge_module,
+        "QGuiApplication",
+        SimpleNamespace(clipboard=lambda: _Clipboard()),
+    )
+    imported: list[list[QUrl]] = []
+    bridge = SimpleNamespace(
+        _dropped_config_path=AppBridge._dropped_config_path,
+        importNodeFiles=lambda values: imported.append(list(values)),
+    )
+
+    AppBridge.importClipboard(bridge)
+
+    assert imported == [urls]

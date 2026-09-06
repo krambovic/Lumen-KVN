@@ -338,3 +338,17 @@ def test_reader_does_not_report_transient_startup_exit_before_retry() -> None:
     assert errors == []
     assert stopped == []
     assert manager._last_exit_code == 1
+
+
+def test_singbox_exit_during_windows_shutdown_is_not_reported_as_runtime_error(monkeypatch) -> None:
+    manager = SingBoxManager()
+    proc = SimpleNamespace(returncode=1)
+    manager._proc = proc
+    manager._running = True
+    errors: list[str] = []
+    manager.error.connect(errors.append)
+    monkeypatch.setattr(manager_module, "is_windows_shutting_down", lambda: True)
+
+    manager._handle_process_exit(proc)
+
+    assert errors == []

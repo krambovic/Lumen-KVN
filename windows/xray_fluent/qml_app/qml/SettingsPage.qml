@@ -879,6 +879,10 @@ Item {
                     Switch { checked: App.reconnectOnNetworkChange; onToggled: App.setReconnectOnNetworkChange(checked) }
                 }
                 SettingRow {
+                    glyph: "\uE7E8"; title: I18n.t("Восстанавливать VPN после сна"); subtitle: I18n.t("Автоматически переподключаться после выхода Windows из сна или гибернации")
+                    Switch { checked: App.reconnectAfterSleep; onToggled: App.setReconnectAfterSleep(checked) }
+                }
+                SettingRow {
                     visible: page.showAdvancedSettings
                     glyph: "\uE968"; title: I18n.t("Предпочитать IPv6"); subtitle: I18n.t("Использовать IPv6-адреса раньше IPv4, если сервер и сеть это поддерживают")
                     Switch { checked: App.preferIpv6; onToggled: App.setPreferIpv6(checked) }
@@ -1072,6 +1076,10 @@ Item {
                     opacity: enabled ? 1.0 : 0.55
                     glyph: "\uE7E8"; title: I18n.t("Запускать автозапуск в трей"); subtitle: I18n.t("При входе в Windows не показывать окно, только иконку в трее")
                     Switch { checked: App.launchInTrayOnStartup; onToggled: App.setLaunchInTrayOnStartup(checked) }
+                }
+                SettingRow {
+                    glyph: "\uE72E"; title: I18n.t("Всегда запускать от администратора"); subtitle: I18n.t("При каждом запуске Windows будет запрашивать права администратора")
+                    Switch { checked: App.alwaysRunAsAdmin; onToggled: App.setAlwaysRunAsAdmin(checked) }
                 }
                 SettingRow {
                     glyph: "\uE768"; title: I18n.t("Автоподключение после запуска"); subtitle: I18n.t("Подключаться к последнему использованному серверу при старте")

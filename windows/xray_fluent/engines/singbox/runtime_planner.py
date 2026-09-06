@@ -10,7 +10,7 @@ import socket
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from ...application.runtime_security import (
     clamp_singbox_local_inbounds,
@@ -24,6 +24,7 @@ from ...constants import (
     DEFAULT_SOCKS_PORT,
     PROXY_HOST,
     SINGBOX_CLASH_API_PORT,
+    SINGBOX_CLASH_API_SELECTOR,
     SINGBOX_TUN_INTERFACE_NAME,
     SINGBOX_XRAY_RELAY_PORT,
     SS_PROTECT_PORT_END,
@@ -118,6 +119,8 @@ class SingboxRuntimePlan:
     used_selected_node: bool
     clash_api_secret: str
     xray_sidecar: SingboxXraySidecarPlan | None
+    clash_api_selector: str = ""
+    clash_api_node_signatures: tuple[tuple[str, str], ...] = ()
 
     @property
     def is_hybrid(self) -> bool:
@@ -200,10 +203,17 @@ def plan_singbox_runtime(
     preferred_protect_password: str = "",
     system_dns_servers: tuple[str, ...] = (),
     tun_mode: bool = True,
+    enable_hot_switch: bool = False,
+    hot_switch_nodes: Iterable[Node] | None = None,
 ) -> SingboxRuntimePlan:
     if _node_is_full_singbox_config(node):
         runtime_config = deepcopy((node.outbound or {}).get("singbox_config") or {})
         normalize_singbox_wireguard_endpoints(runtime_config)
+        # Keep legacy AWG 1.5 imports readable on disk, but never pass their
+        # removed members to the strict extended 2.6.x decoder.  Full imported
+        # profiles bypass the selected-node path, so sanitize them here too.
+        _strip_legacy_awg15_fields(runtime_config)
+        _ensure_awg3_windows_bind_workarounds(runtime_config)
         _normalize_openvpn_outbounds(runtime_config)
         strip_singbox_proxy_inbounds(runtime_config)
         _configure_singbox_runtime_inbounds(
@@ -286,6 +296,8 @@ def plan_singbox_runtime(
         # The runtime contracts reference outbound `proxy`; a document whose own
         # proxy outbound is tagged differently needs the alias to resolve them.
         _ensure_full_config_proxy_alias(runtime_config)
+        _strip_legacy_awg15_fields(runtime_config)
+        _ensure_awg3_windows_bind_workarounds(runtime_config)
         if routing is not None:
             apply_singbox_gui_routing(runtime_config, routing)
         _ensure_all_server_bootstrap_contracts(runtime_config)
@@ -347,9 +359,21 @@ def plan_singbox_runtime(
     native_is_endpoint = _is_singbox_endpoint(native_proxy)
     if native_is_endpoint:
         outbounds.pop(proxy_index)
+        _strip_legacy_awg15_fields(native_proxy)
+        ensure_awg3_windows_bind_workaround(runtime_config, native_proxy)
         _replace_or_append_tagged(_ensure_list(runtime_config, "endpoints"), "proxy", native_proxy)
     else:
         outbounds[proxy_index] = native_proxy
+    clash_api_selector = ""
+    clash_api_node_signatures: tuple[tuple[str, str], ...] = ()
+    if enable_hot_switch and tun_mode:
+        clash_api_selector, clash_api_node_signatures = _ensure_singbox_hot_switch_selector(
+            runtime_config,
+            selected_node=node,
+            candidate_nodes=hot_switch_nodes,
+            multiplex_enabled=multiplex_enabled,
+            multiplex_concurrency=multiplex_concurrency,
+        )
     if routing is not None:
         apply_singbox_gui_routing(runtime_config, routing)
     _ensure_all_server_bootstrap_contracts(runtime_config)
@@ -373,6 +397,8 @@ def plan_singbox_runtime(
         used_selected_node=True,
         clash_api_secret=clash_api_secret,
         xray_sidecar=None,
+        clash_api_selector=clash_api_selector,
+        clash_api_node_signatures=clash_api_node_signatures,
     )
 
 
@@ -499,6 +525,119 @@ def _node_is_full_singbox_config(node: Node | None) -> bool:
     return str(outbound.get("protocol") or node.scheme or "").strip().lower() == "singbox_config" and isinstance(
         outbound.get("singbox_config"),
         dict,
+    )
+
+
+def singbox_node_tag(node_id: str) -> str:
+    """Return a stable, opaque outbound tag for a stored Lumen node."""
+    digest = hashlib.sha256(str(node_id or "").encode("utf-8")).hexdigest()
+    return f"lumen-node-{digest[:20]}"
+
+
+def singbox_node_source_signature(node: Node) -> str:
+    """Return the source data used to build a node's native outbound."""
+    payload = {
+        "scheme": str(node.scheme or ""),
+        "server": str(node.server or ""),
+        "port": int(node.port),
+        "link": str(node.link or ""),
+        "outbound": node.outbound if isinstance(node.outbound, dict) else {},
+    }
+    text = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _ensure_singbox_hot_switch_selector(
+    config: dict[str, Any],
+    *,
+    selected_node: Node,
+    candidate_nodes: Iterable[Node] | None,
+    multiplex_enabled: bool,
+    multiplex_concurrency: int,
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Build a selector containing every node usable by native sing-box.
+
+    The regular runtime still exposes the selected node as ``proxy``.  This
+    helper replaces that single outbound only when at least two stored nodes
+    can be represented natively, leaving unsupported/hybrid nodes to the
+    existing restart fallback.
+    """
+    outbounds = config.get("outbounds")
+    if not isinstance(outbounds, list):
+        return "", ()
+
+    candidates: list[Node] = [selected_node]
+    seen_ids = {selected_node.id}
+    for node in candidate_nodes or ():
+        if node.id in seen_ids:
+            continue
+        seen_ids.add(node.id)
+        candidates.append(node)
+
+    native_entries: list[tuple[str, Node, dict[str, Any]]] = []
+    for node in candidates:
+        if _node_is_full_singbox_config(node) or _node_should_use_xray_sidecar(node):
+            continue
+        try:
+            native = build_singbox_outbound(
+                node,
+                tag=singbox_node_tag(node.id),
+                multiplex_enabled=multiplex_enabled,
+                multiplex_concurrency=multiplex_concurrency,
+            )
+        except (TypeError, ValueError):
+            continue
+        native_entries.append((singbox_node_tag(node.id), node, native))
+
+    selected_tag = singbox_node_tag(selected_node.id)
+    if len(native_entries) < 2 or not any(tag == selected_tag for tag, _, _ in native_entries):
+        return "", ()
+
+    endpoints = _ensure_list(config, "endpoints")
+    outbounds[:] = [
+        item
+        for item in outbounds
+        if not (isinstance(item, dict) and str(item.get("tag") or "") == SINGBOX_CLASH_API_SELECTOR)
+    ]
+    endpoints[:] = [
+        item
+        for item in endpoints
+        if not (
+            isinstance(item, dict)
+            and (
+                str(item.get("tag") or "") == SINGBOX_CLASH_API_SELECTOR
+                or str(item.get("tag") or "").startswith("lumen-node-")
+            )
+        )
+    ]
+
+    member_tags: list[str] = []
+    for tag, node, native in native_entries:
+        member_tags.append(tag)
+        if _is_singbox_endpoint(native):
+            _strip_legacy_awg15_fields(native)
+            ensure_awg3_windows_bind_workaround(config, native)
+            _replace_or_append_tagged(endpoints, tag, native)
+            _ensure_endpoint_server_bootstrap_contract(config, native)
+        else:
+            outbounds.append(native)
+            if str(native.get("type") or "").strip().lower() == "openvpn":
+                _ensure_openvpn_server_bootstrap_contract(config, native)
+            else:
+                _ensure_proxy_server_bootstrap_contract(config, native, node.server)
+
+    outbounds.append(
+        {
+            "type": "selector",
+            "tag": SINGBOX_CLASH_API_SELECTOR,
+            "outbounds": member_tags,
+            "default": selected_tag,
+            "interrupt_exist_connections": True,
+        }
+    )
+    return SINGBOX_CLASH_API_SELECTOR, tuple(
+        (node.id, singbox_node_source_signature(node))
+        for _, node, _ in native_entries
     )
 
 
@@ -795,6 +934,82 @@ def _ensure_proxy_server_bootstrap_contract(
         for cidr in endpoint_cidrs:
             _ensure_direct_ip_route(payload, cidr)
     _ensure_direct_domain_route(payload, server)
+
+
+AWG3_DIRECT_DETOUR_TAG = "awg3-direct"
+
+
+def _strip_legacy_awg15_fields(payload: dict[str, Any]) -> bool:
+    """Remove AWG 1.5-only fields before handing data to extended 2.6.x.
+
+    Older imports remain readable/editable (and can still be exported), while
+    the current strict sing-box schema never receives the removed J1-J3/Itime
+    members.  The operation is deliberately limited to the runtime copy.
+    """
+    changed = False
+    endpoints = payload.get("endpoints") if isinstance(payload.get("endpoints"), list) else None
+    candidates = endpoints if endpoints is not None else [payload]
+    for endpoint in candidates:
+        if not isinstance(endpoint, dict):
+            continue
+        amnezia = endpoint.get("amnezia")
+        if not isinstance(amnezia, dict):
+            continue
+        for key in ("j1", "j2", "j3", "itime"):
+            if key in amnezia:
+                amnezia.pop(key, None)
+                changed = True
+    return changed
+
+
+def endpoint_needs_windows_bind_workaround(endpoint: dict[str, Any]) -> bool:
+    """Return whether an AWG 3.0 endpoint needs a non-default Windows bind."""
+    amnezia = endpoint.get("amnezia")
+    return isinstance(amnezia, dict) and bool(
+        str(amnezia.get("header_protection_key") or "").strip()
+    )
+
+
+def ensure_awg3_windows_bind_workaround(
+    runtime_config: dict[str, Any], endpoint: dict[str, Any]
+) -> bool:
+    """Route AWG 3.0 through a direct detour to avoid the Windows bind bug.
+
+    The extended core's default Windows WireGuard listener rewrites bytes that
+    are part of AWG 3.0 header-protection's nonce.  A detour selects the
+    userspace ClientBind path and leaves those bytes intact.  Explicit user
+    detours are preserved.
+    """
+    if not endpoint_needs_windows_bind_workaround(endpoint):
+        return False
+    if str(endpoint.get("detour") or "").strip():
+        return False
+    outbounds = _ensure_list(runtime_config, "outbounds")
+    if not any(
+        isinstance(item, dict) and item.get("tag") == AWG3_DIRECT_DETOUR_TAG
+        for item in outbounds
+    ):
+        outbounds.append({"type": "direct", "tag": AWG3_DIRECT_DETOUR_TAG})
+    endpoint["detour"] = AWG3_DIRECT_DETOUR_TAG
+    return True
+
+
+def _ensure_awg3_windows_bind_workarounds(runtime_config: dict[str, Any]) -> bool:
+    """Apply the AWG 3.0 Windows bind workaround to imported endpoints.
+
+    Selected-node plans call :func:`ensure_awg3_windows_bind_workaround`
+    directly.  A full sing-box document can contain several endpoints and does
+    not have a selected ``Node`` to pass through that path, so inspect all
+    top-level endpoints without changing explicit detours.
+    """
+    endpoints = runtime_config.get("endpoints")
+    if not isinstance(endpoints, list):
+        return False
+    changed = False
+    for endpoint in endpoints:
+        if isinstance(endpoint, dict):
+            changed = ensure_awg3_windows_bind_workaround(runtime_config, endpoint) or changed
+    return changed
 
 
 def _ensure_endpoint_server_bootstrap_contract(payload: dict[str, Any], endpoint: dict[str, Any]) -> None:
@@ -1703,7 +1918,8 @@ def _ensure_singbox_dns_runtime_contract(
     if not isinstance(dns, dict):
         dns = {}
         payload["dns"] = dns
-    dns["independent_cache"] = True
+    # sing-box 1.14 keys DNS cache entries by transport automatically;
+    # independent_cache is deprecated and will be removed in 1.16.
     direct_server = routing.dns_bootstrap_server if routing is not None else _DEFAULT_DIRECT_DNS_SERVER
     direct_type = routing.dns_bootstrap_type if routing is not None else _DEFAULT_DIRECT_DNS_TYPE
     direct_strategy = _dns_strategy(routing.dns_bootstrap_strategy if routing is not None else "")

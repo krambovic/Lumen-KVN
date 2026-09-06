@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import base64
 import binascii
+from dataclasses import dataclass, field
 import hashlib
 import hmac
 import json
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from PyQt6.QtCore import QTimer
 
-from ..constants import APP_VERSION
+from ..constants import APP_VERSION, SUBSCRIPTION_PARSER_REVISION
 from ..country_flags import detect_country
 from ..data_paths import get_install_id
 from ..happ_crypt import HappDecryptError, decrypt_happ_link, is_happ_crypt_link, is_happ_link
@@ -34,6 +35,19 @@ HAPP_WINDOWS_USER_AGENT = "Happ/2.18.3/Windows/2606241603601"
 # Lumen's own subscription User-Agent; the Android build sends the same shape
 # with an "Android-" platform tag.
 LUMEN_SUBSCRIPTION_USER_AGENT = f"Lumen-Subscription/Windows-{APP_VERSION}"
+
+
+@dataclass(slots=True)
+class SubscriptionPayloadResult:
+    """Network result used by the worker and conditional subscription updates."""
+
+    text: str = ""
+    userinfo: dict = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+    headers: dict[str, str] = field(default_factory=dict)
+    status: int = 0
+    not_modified: bool = False
+
 
 # Parameters documented by Happ for premium subscriptions.  Keep the original
 # kebab-case names in persisted metadata so providers and users can see exactly
@@ -425,6 +439,16 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _decode_subscription_bytes(raw: bytes) -> str:
+    """Decode provider text while tolerating legacy Windows/Chinese encodings."""
+    for encoding in ("utf-8", "cp1251", "gb18030", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def _maybe_base64_decode(text: str) -> str:
     """Подписки часто отдают base64-блоб со списком ссылок."""
     if "://" in text:
@@ -435,7 +459,7 @@ def _maybe_base64_decode(text: str) -> str:
     for decoder in (base64.urlsafe_b64decode, base64.b64decode):
         try:
             padded = compact + "=" * (-len(compact) % 4)
-            decoded = decoder(padded).decode("utf-8", errors="strict")
+            decoded = _decode_subscription_bytes(decoder(padded))
         except (binascii.Error, ValueError, UnicodeDecodeError):
             continue
         if "://" in decoded:
@@ -954,6 +978,7 @@ def _fetch_subscription_with_headers(
     cancelled=None,
     response_opened=None,
     response_closed=None,
+    response_meta: dict[str, object] | None = None,
 ) -> tuple[str, dict]:
     """Загружает подписку и возвращает (текст_со_ссылками, userinfo).
 
@@ -978,6 +1003,25 @@ def _fetch_subscription_with_headers(
         )
     except SubscriptionFetcherCancelled as exc:
         raise SubscriptionFetchCancelled(str(exc)) from exc
+    if response_meta is not None:
+        response_meta.clear()
+        response_meta.update(
+            {
+                "status": int(getattr(response, "status", 0) or 0),
+                "headers": dict(getattr(response, "headers", {}) or {}),
+                "transport": str(getattr(response, "transport", "") or ""),
+            }
+        )
+        # SubscriptionHttpPayload keeps normalized headers; use those when
+        # available so callers can reliably look up ETag/Last-Modified.
+        payload_headers = getattr(response, "headers", None)
+        if isinstance(payload_headers, dict):
+            response_meta["headers"] = {
+                str(key).lower(): str(value)
+                for key, value in payload_headers.items()
+            }
+        response_meta["status"] = int(getattr(response, "status", 0) or 0)
+        response_meta["transport"] = str(getattr(response, "transport", "") or "")
     effective_url = str(response.headers.get("x-lumen-effective-url") or url).strip()
     if urlparse(url).scheme.lower() == "https" and urlparse(effective_url).scheme.lower() != "https":
         raise RuntimeError("Subscription redirect from HTTPS to an insecure URL was blocked")
@@ -991,6 +1035,11 @@ def _fetch_subscription_with_headers(
     text, body_info = _extract_userinfo_from_body(text)
     # Данные из тела приоритетнее заголовка.
     userinfo = _merge_subscription_info(userinfo, directive_info, body_info, metadata)
+    if int(getattr(response, "status", 0) or 0) == 304:
+        # A conditional hit deliberately has no body.  The outer fetch loop
+        # recognizes this marker and never replaces the existing node snapshot.
+        userinfo["_lumen_not_modified"] = True
+        return "", userinfo
     decoded = _maybe_base64_decode(text)
     return (decoded or text), userinfo
 
@@ -1230,6 +1279,103 @@ def _subscription_id(controller: AppController, url: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, url.strip()))
 
 
+def _subscription_source_key(node: Node) -> str:
+    """Build a stable identity for one provider entry.
+
+    Provider ordering, display names and insignificant URI formatting change
+    frequently.  The protocol/server/port plus canonical outbound is stable
+    enough to reconcile snapshots while still distinguishing real replacements.
+    """
+    existing = str(getattr(node, "source_key", "") or "").strip()
+    if existing:
+        return existing
+    payload = {
+        "scheme": str(node.scheme or "").strip().lower(),
+        "server": str(node.server or "").strip().lower(),
+        "port": int(node.port or 0),
+        "outbound": node.outbound if isinstance(node.outbound, dict) else {},
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _subscription_fallback_key(node: Node) -> tuple[str, str, int, str]:
+    return (
+        str(node.scheme or "").strip().lower(),
+        str(node.server or "").strip().lower(),
+        int(node.port or 0),
+        str(node.name or "").strip().casefold(),
+    )
+
+
+def _mark_subscription_fetch_metadata(
+    subscription: dict,
+    *,
+    headers: dict[str, str] | None = None,
+    status: int = 0,
+    success: bool = False,
+    not_modified: bool = False,
+    error: str = "",
+) -> None:
+    """Persist validators/timestamps and bounded exponential retry backoff."""
+    now = _utc_now_iso()
+    normalized_headers = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    if normalized_headers.get("etag"):
+        subscription["etag"] = normalized_headers["etag"]
+    if normalized_headers.get("last-modified"):
+        subscription["last_modified"] = normalized_headers["last-modified"]
+    subscription["last_checked_at"] = now
+    subscription["parser_revision"] = SUBSCRIPTION_PARSER_REVISION
+    subscription["last_status"] = int(status or 0)
+    if success or not_modified:
+        subscription["last_success_at"] = now
+        subscription["failure_count"] = 0
+        subscription["backoff_until"] = ""
+        subscription["last_error"] = ""
+        return
+    if error:
+        try:
+            failures = max(0, int(subscription.get("failure_count") or 0)) + 1
+        except (TypeError, ValueError):
+            failures = 1
+        subscription["failure_count"] = failures
+        # 15m, 30m, 60m ... capped at six hours; Retry-After is handled by
+        # callers as a status-specific error but never disables manual retry.
+        delay_minutes = min(360, 15 * (2 ** min(failures - 1, 5)))
+        subscription["backoff_until"] = (
+            datetime.fromisoformat(now) + timedelta(minutes=delay_minutes)
+        ).isoformat()
+        subscription["last_error"] = str(error)[:500]
+
+
+def _fetch_with_optional_meta(
+    url: str,
+    profile_name: str,
+    headers: dict[str, str],
+    *,
+    response_meta: dict[str, object],
+    **options,
+) -> tuple[str, dict]:
+    """Call the fetch helper while keeping compatibility with test/providers.
+
+    A few integrations monkeypatch the old helper signature.  Falling back
+    only for an unexpected ``response_meta`` keyword keeps those callers
+    working without hiding real network/type errors.
+    """
+    try:
+        return _fetch_subscription_with_headers(
+            url,
+            profile_name,
+            headers,
+            response_meta=response_meta,
+            **options,
+        )
+    except TypeError as exc:
+        if "response_meta" not in str(exc):
+            raise
+        return _fetch_subscription_with_headers(url, profile_name, headers, **options)
+
+
 def fetch_subscription_payload(
     url: str,
     *,
@@ -1242,6 +1388,9 @@ def fetch_subscription_payload(
     cancelled=None,
     response_opened=None,
     response_closed=None,
+    cache_etag: str = "",
+    cache_last_modified: str = "",
+    response_meta: dict[str, object] | None = None,
 ) -> tuple[str, dict, list[str]]:
     """Загружает подписку по сети и возвращает (текст_ссылок, userinfo, errors).
 
@@ -1306,20 +1455,39 @@ def fetch_subscription_payload(
                 },
             ),
         )
+    validators = {
+        "If-None-Match": str(cache_etag or "").strip(),
+        "If-Modified-Since": str(cache_last_modified or "").strip(),
+    }
+    if any(validators.values()):
+        for _profile_name, profile_headers in profiles:
+            for key, value in validators.items():
+                if value:
+                    profile_headers[key] = value
+    request_meta: dict[str, object] = {}
     for profile_name, headers in profiles:
         _raise_if_subscription_cancelled(cancelled)
         try:
-            text, userinfo = _fetch_subscription_with_headers(
+            request_meta.clear()
+            text, userinfo = _fetch_with_optional_meta(
                 url,
                 profile_name,
                 headers,
+                response_meta=request_meta,
                 **fetch_options,
             )
+            if response_meta is not None:
+                response_meta.clear()
+                response_meta.update(request_meta)
             userinfo = _merge_subscription_info(_metadata_from_subscription_url(url), userinfo)
             network_path = "proxy-tun" if use_proxy_tun else "direct"
             userinfo = {**userinfo, "networkPath": network_path}
             if userinfo and not first_userinfo:
                 first_userinfo = dict(userinfo)
+            if userinfo.get("_lumen_not_modified") or int(request_meta.get("status") or 0) == 304:
+                userinfo = dict(userinfo)
+                userinfo["_lumen_not_modified"] = True
+                return "", userinfo, []
             nodes, errors = parse_links_text(text)
             if _subscription_response_is_accepted(text, nodes):
                 return text, userinfo, errors
@@ -1329,17 +1497,26 @@ def fetch_subscription_payload(
         except Exception as exc:  # noqa: BLE001 - пробуем следующий профиль клиента
             if _is_tls_eof_error(exc):
                 try:
-                    text, userinfo = _fetch_subscription_with_headers(
+                    request_meta.clear()
+                    text, userinfo = _fetch_with_optional_meta(
                         url,
                         profile_name,
                         headers,
+                        response_meta=request_meta,
                         **fetch_options,
                     )
+                    if response_meta is not None:
+                        response_meta.clear()
+                        response_meta.update(request_meta)
                     userinfo = _merge_subscription_info(_metadata_from_subscription_url(url), userinfo)
                     network_path = "proxy-tun" if use_proxy_tun else "direct"
                     userinfo = {**userinfo, "networkPath": network_path}
                     if userinfo and not first_userinfo:
                         first_userinfo = dict(userinfo)
+                    if userinfo.get("_lumen_not_modified") or int(request_meta.get("status") or 0) == 304:
+                        userinfo = dict(userinfo)
+                        userinfo["_lumen_not_modified"] = True
+                        return "", userinfo, []
                     nodes, errors = parse_links_text(text)
                     if _subscription_response_is_accepted(text, nodes):
                         return text, {**userinfo, "networkPath": network_path}, errors
@@ -1366,6 +1543,58 @@ def fetch_subscription_payload(
             if _is_permanent_subscription_error(exc):
                 break
     return "", first_userinfo, attempts or ["Не удалось загрузить подписку"]
+
+
+def fetch_subscription_payload_result(
+    url: str,
+    *,
+    user_agent: str = "",
+    hwid: str = DEFAULT_SUBSCRIPTION_HWID,
+    use_real_hwid: bool = True,
+    use_proxy_tun: bool = False,
+    proxy_url: str = "",
+    converter_url: str = "",
+    cache_etag: str = "",
+    cache_last_modified: str = "",
+    cancelled=None,
+    response_opened=None,
+    response_closed=None,
+) -> SubscriptionPayloadResult:
+    """Fetch a subscription while retaining HTTP validators/status metadata."""
+    metadata: dict[str, object] = {}
+    text, userinfo, errors = fetch_subscription_payload(
+        url,
+        user_agent=user_agent,
+        hwid=hwid,
+        use_real_hwid=use_real_hwid,
+        use_proxy_tun=use_proxy_tun,
+        proxy_url=proxy_url,
+        converter_url=converter_url,
+        cache_etag=cache_etag,
+        cache_last_modified=cache_last_modified,
+        cancelled=cancelled,
+        response_opened=response_opened,
+        response_closed=response_closed,
+        response_meta=metadata,
+    )
+    info = dict(userinfo or {})
+    not_modified = bool(info.pop("_lumen_not_modified", False)) or int(
+        metadata.get("status") or 0
+    ) == 304
+    headers = metadata.get("headers")
+    normalized_headers = (
+        {str(key).lower(): str(value) for key, value in headers.items()}
+        if isinstance(headers, dict)
+        else {}
+    )
+    return SubscriptionPayloadResult(
+        text=text or "",
+        userinfo=info,
+        errors=list(errors or []),
+        headers=normalized_headers,
+        status=int(metadata.get("status") or 0),
+        not_modified=not_modified,
+    )
 
 
 def _subscription_converter_target(template: str, source_url: str) -> str:
@@ -1506,11 +1735,32 @@ def _apply_subscription_payload(
     fetched: tuple[str, dict, list[str]],
     *,
     replace_existing_group: bool = False,
+    response_meta: dict[str, object] | None = None,
 ) -> tuple[int, list[str], dict]:
     """Apply a fetched subscription as one in-memory transaction."""
     chosen_text, chosen_userinfo, chosen_errors = fetched
     result_info = dict(chosen_userinfo or {})
     result_info["_lumen_applied"] = False
+    if result_info.pop("_lumen_not_modified", False) or bool(
+        (response_meta or {}).get("not_modified")
+    ):
+        subscription = _find_subscription(controller, url)
+        if subscription is not None:
+            headers = (response_meta or {}).get("headers")
+            _mark_subscription_fetch_metadata(
+                subscription,
+                headers=headers if isinstance(headers, dict) else {},
+                status=int((response_meta or {}).get("status") or 304),
+                success=True,
+                not_modified=True,
+            )
+            subscription["node_count"] = sum(
+                1 for node in controller.state.nodes if node.subscription_id == subscription.get("id")
+            )
+            controller.subscriptions_changed.emit(list(controller.state.subscriptions))
+            controller.save()
+        result_info["_lumen_not_modified"] = True
+        return 0, [], result_info
     if not chosen_text:
         return 0, list(chosen_errors), result_info
 
@@ -1533,6 +1783,7 @@ def _apply_subscription_payload(
         seen_links.add(node.link)
         node.group = group
         node.subscription_id = subscription_id
+        node.source_key = _subscription_source_key(node)
         if not node.country_code:
             node.country_code = detect_country(node.name, node.server)
         prepared.append(node)
@@ -1554,7 +1805,12 @@ def _apply_subscription_payload(
         )
     ]
     old_ids = {node.id for node in old_nodes}
+    old_by_key: dict[str, list[Node]] = {}
     old_by_link = {node.link: node for node in old_nodes if node.link}
+    old_by_fallback: dict[tuple[str, str, int, str], list[Node]] = {}
+    for old_node in old_nodes:
+        old_by_key.setdefault(_subscription_source_key(old_node), []).append(old_node)
+        old_by_fallback.setdefault(_subscription_fallback_key(old_node), []).append(old_node)
     occupied_nodes = {
         (node.link, (node.group or "Default").strip().casefold())
         for node in controller.state.nodes
@@ -1574,16 +1830,55 @@ def _apply_subscription_payload(
         (node.sort_order for node in controller.state.nodes if node.id not in old_ids),
         default=0,
     )
+    used_old_ids: set[str] = set()
+    reconnect_needed = False
     for node in prepared:
-        previous = old_by_link.get(node.link)
+        previous = next(
+            (candidate for candidate in old_by_key.get(node.source_key, []) if candidate.id not in used_old_ids),
+            None,
+        )
+        if previous is None:
+            previous = old_by_link.get(node.link)
+            if previous is not None and previous.id in used_old_ids:
+                previous = None
+        if previous is None:
+            candidates = [
+                candidate
+                for candidate in old_by_fallback.get(_subscription_fallback_key(node), [])
+                if candidate.id not in used_old_ids
+            ]
+            if len(candidates) == 1:
+                previous = candidates[0]
         if previous is not None:
+            previous_outbound = json.dumps(
+                previous.outbound if isinstance(previous.outbound, dict) else {},
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            incoming_outbound = json.dumps(
+                node.outbound if isinstance(node.outbound, dict) else {},
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if previous.id == selected_id and previous_outbound != incoming_outbound:
+                reconnect_needed = True
+            used_old_ids.add(previous.id)
             node.id = previous.id
+            node.source_key = _subscription_source_key(node)
             node.sort_order = previous.sort_order
             node.ping_ms = previous.ping_ms
             node.speed_mbps = previous.speed_mbps
             node.is_alive = previous.is_alive
             node.ping_history = list(previous.ping_history)
             node.speed_history = list(previous.speed_history)
+            node.last_used_at = previous.last_used_at
+            node.created_at = previous.created_at
+            node.tags = list(previous.tags)
+            node.description = previous.description
+            if previous.country_code:
+                node.country_code = previous.country_code
         else:
             max_order += 1
             node.sort_order = max_order
@@ -1599,9 +1894,14 @@ def _apply_subscription_payload(
     if premium_applied:
         result_info["premiumApplied"] = premium_applied
 
-    reconnect_needed = False
     if selected_old is not None:
-        replacement = next((node for node in prepared if node.link == selected_old.link), None)
+        selected_key = _subscription_source_key(selected_old)
+        replacement = next(
+            (node for node in prepared if _subscription_source_key(node) == selected_key),
+            None,
+        )
+        if replacement is None:
+            replacement = next((node for node in prepared if node.link == selected_old.link), None)
         if replacement is None:
             replacement = prepared[0]
             reconnect_needed = True
@@ -1610,6 +1910,8 @@ def _apply_subscription_payload(
     controller.nodes_changed.emit(controller.state.nodes)
     controller.selection_changed.emit(controller.selected_node)
     result_info["_lumen_applied"] = True
+    if response_meta:
+        result_info["_lumen_response_meta"] = dict(response_meta)
     if reconnect_needed and (controller.connected or controller._desired_connected):
         controller._desired_connected = True
         controller._request_transition("active subscription updated")
@@ -1627,7 +1929,12 @@ def _import_subscription_payload(
 ) -> tuple[int, list[str], dict]:
     # Синхронный путь (блокирует поток). Оставлен для обратной совместимости.
     settings = controller.state.settings
-    fetched = fetch_subscription_payload(
+    subscription = _find_subscription(controller, url)
+    cache_allowed = bool(
+        subscription
+        and int(subscription.get("parser_revision") or 0) == SUBSCRIPTION_PARSER_REVISION
+    )
+    fetched_result = fetch_subscription_payload_result(
         url,
         user_agent=getattr(settings, "subscription_user_agent", ""),
         hwid=getattr(settings, "subscription_hwid", DEFAULT_SUBSCRIPTION_HWID),
@@ -1637,14 +1944,46 @@ def _import_subscription_payload(
             if getattr(settings, "subscription_converter_enabled", False)
             else ""
         ),
+        cache_etag=str((subscription or {}).get("etag") or "") if cache_allowed else "",
+        cache_last_modified=(
+            str((subscription or {}).get("last_modified") or "") if cache_allowed else ""
+        ),
     )
     effective_group = group
     if prefer_metadata_name:
-        effective_group = _subscription_name_from_info(fetched[1]) or group
+        effective_group = _subscription_name_from_info(fetched_result.userinfo) or group
+    fetched = (
+        fetched_result.text,
+        fetched_result.userinfo,
+        fetched_result.errors,
+    )
     added, errors, info = _apply_subscription_payload(
-        controller, url, effective_group, fetched, replace_existing_group=replace_existing_group
+        controller,
+        url,
+        effective_group,
+        fetched,
+        replace_existing_group=replace_existing_group,
+        response_meta={
+            "headers": fetched_result.headers,
+            "status": fetched_result.status,
+            "not_modified": fetched_result.not_modified,
+        },
     )
     info["_lumen_group"] = effective_group
+    # Synchronous imports/updates use the same cache metadata contract as the
+    # background worker.  Keep failures visible and apply bounded backoff so a
+    # startup refresh cannot hammer an unavailable provider.
+    if not info.get("_lumen_applied") and not info.get("_lumen_not_modified"):
+        subscription = _find_subscription(controller, url)
+        if subscription is not None and fetched_result.errors:
+            _mark_subscription_fetch_metadata(
+                subscription,
+                headers=fetched_result.headers,
+                status=fetched_result.status,
+                error=fetched_result.errors[0],
+            )
+            controller.subscriptions_changed.emit(list(controller.state.subscriptions))
+            controller.save()
     return added, errors, info
 
 
@@ -1654,6 +1993,7 @@ def _record_subscription(
     group: str,
     node_count: int,
     userinfo: dict | None = None,
+    response_meta: dict[str, object] | None = None,
 ) -> None:
     now = _utc_now_iso()
     info = dict(userinfo) if isinstance(userinfo, dict) else {}
@@ -1671,18 +2011,33 @@ def _record_subscription(
             existing["userinfo"] = info
         elif "userinfo" not in existing:
             existing["userinfo"] = {}
-    else:
-        controller.state.subscriptions.append(
-            {
-                "id": subscription_id,
-                "url": url,
-                "name": group,
-                "group": group,
-                "updated_at": now,
-                "node_count": node_count,
-                "userinfo": info,
-            }
+        meta = response_meta or {}
+        headers = meta.get("headers")
+        _mark_subscription_fetch_metadata(
+            existing,
+            headers=headers if isinstance(headers, dict) else {},
+            status=int(meta.get("status") or 200),
+            success=True,
         )
+    else:
+        created = {
+            "id": subscription_id,
+            "url": url,
+            "name": group,
+            "group": group,
+            "updated_at": now,
+            "node_count": node_count,
+            "userinfo": info,
+        }
+        _mark_subscription_fetch_metadata(
+            created,
+            headers=(response_meta or {}).get("headers")
+            if isinstance((response_meta or {}).get("headers"), dict)
+            else {},
+            status=int((response_meta or {}).get("status") or 200),
+            success=True,
+        )
+        controller.state.subscriptions.append(created)
     controller.subscriptions_changed.emit(list(controller.state.subscriptions))
     controller.save()
 
@@ -1726,8 +2081,16 @@ def import_subscription(
     )
     group = str(userinfo.pop("_lumen_group", group) or group)
     effective_url = str(userinfo.pop("_lumen_effective_url", url) or url)
+    meta = userinfo.pop("_lumen_response_meta", None)
     if userinfo.pop("_lumen_applied", False):
-        _record_subscription(controller, effective_url, group, added, userinfo)
+        _record_subscription(
+            controller,
+            effective_url,
+            group,
+            added,
+            userinfo,
+            meta if isinstance(meta, dict) else None,
+        )
     return added, errors
 
 
@@ -1742,8 +2105,16 @@ def update_subscription(controller: AppController, url: str) -> tuple[int, list[
     )
     userinfo.pop("_lumen_group", None)
     effective_url = str(userinfo.pop("_lumen_effective_url", url) or url)
+    meta = userinfo.pop("_lumen_response_meta", None)
     if userinfo.pop("_lumen_applied", False):
-        _record_subscription(controller, effective_url, group, added, userinfo)
+        _record_subscription(
+            controller,
+            effective_url,
+            group,
+            added,
+            userinfo,
+            meta if isinstance(meta, dict) else None,
+        )
     return added, errors
 
 
@@ -1768,6 +2139,7 @@ def apply_fetched_subscription(
     text: str,
     userinfo: dict | None,
     errors: list[str] | None,
+    response_meta: dict | None = None,
 ) -> tuple[int, list[str]]:
     """Применяет подписку, загруженную в фоне (вызывать в GUI-потоке).
 
@@ -1812,13 +2184,41 @@ def apply_fetched_subscription(
 
     fetched = (text or "", dict(userinfo or {}), list(errors or []))
     added, errs, info = _apply_subscription_payload(
-        controller, url, group, fetched, replace_existing_group=replace
+        controller,
+        url,
+        group,
+        fetched,
+        replace_existing_group=replace,
+        response_meta=dict(response_meta or {}),
     )
     applied = bool(info.pop("_lumen_applied", False))
+    meta = info.pop("_lumen_response_meta", None)
+    if info.pop("_lumen_not_modified", False):
+        # The existing snapshot is intentionally left untouched for HTTP 304.
+        return added, errs
     if not applied:
+        if existing is not None:
+            meta_value = meta if isinstance(meta, dict) else dict(response_meta or {})
+            _mark_subscription_fetch_metadata(
+                existing,
+                headers=meta_value.get("headers")
+                if isinstance(meta_value.get("headers"), dict)
+                else {},
+                status=int(meta_value.get("status") or 0),
+                error=(errs or ["Не удалось применить подписку"])[0],
+            )
+            controller.subscriptions_changed.emit(list(controller.state.subscriptions))
+            controller.save()
         return added, errs
     effective_url = str(info.pop("_lumen_effective_url", url) or url)
-    _record_subscription(controller, effective_url, group, added, info)
+    _record_subscription(
+        controller,
+        effective_url,
+        group,
+        added,
+        info,
+        meta if isinstance(meta, dict) else dict(response_meta or {}),
+    )
     return added, errs
 
 

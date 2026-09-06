@@ -103,6 +103,8 @@ def can_tun_hot_swap(
     has_selected_node: bool,
     current_tun_layer_signature: str,
 ) -> bool:
-    if not settings_tun_mode or not session.tun_mode:
+    if not settings_tun_mode or not session.tun_mode or not has_selected_node:
         return False
-    return session.active_core == "singbox"
+    if session.active_core != "singbox" or not session.clash_api_selector:
+        return False
+    return session.tun_layer_signature == current_tun_layer_signature

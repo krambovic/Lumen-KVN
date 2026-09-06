@@ -2,7 +2,9 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$OutputPath,
-    [string]$Ref = "v1.13.14-extended-2.5.1",
+    # Latest extended release. 1.14 moved WireGuard outbounds to endpoints;
+    # Lumen's runtime planner performs that migration before launch.
+    [string]$Ref = "v1.14.0-extended-2.7.1",
     [string]$Repository = "https://github.com/shtorm-7/sing-box-extended.git",
     [string]$LumenRevision = "1",
     [string]$WorkDirectory = ""
@@ -33,11 +35,11 @@ try {
         throw "failed to clone sing-box-extended ref $Ref"
     }
 
-    & git -C $source apply --check $patchPath
+    & git -C $source apply --unidiff-zero --check $patchPath
     if ($LASTEXITCODE -ne 0) {
         throw "the Lumen MASQUE patch is incompatible with sing-box-extended $Ref"
     }
-    & git -C $source apply $patchPath
+    & git -C $source apply --unidiff-zero $patchPath
     if ($LASTEXITCODE -ne 0) {
         throw "failed to apply the Lumen MASQUE patch"
     }

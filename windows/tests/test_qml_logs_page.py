@@ -7,22 +7,23 @@ ROOT = Path(__file__).parents[1]
 QML_DIR = ROOT / "xray_fluent" / "qml_app" / "qml"
 
 
-def test_log_list_keeps_original_rounded_row_design() -> None:
+def test_log_list_uses_the_legacy_table_rows_and_keeps_event_stream() -> None:
     logs_qml = (QML_DIR / "LogsPage.qml").read_text(encoding="utf-8")
 
     assert "hoverable: false" in logs_qml
     assert "id: logList" in logs_qml
     assert "delegate: Rectangle" in logs_qml
-    assert 'color: index % 2 === 0 ? "transparent" : Theme.card' in logs_qml
     assert "radius: Theme.radiusSmall" in logs_qml
-    assert "anchors.leftMargin: 4" in logs_qml
     assert "component SelectableLogText: FluentTextEdit" in logs_qml
     assert "selectByMouse: true" in logs_qml
     assert "persistentSelection: false" in logs_qml
-    assert "textFormat: TextEdit.RichText" in logs_qml
-    assert "textFormat: TextEdit.StyledText" not in logs_qml
-    assert "App.logModel.entries()" not in logs_qml
-    assert "<table" not in logs_qml
+    assert "text: page.formattedLog(time, source, level, line, details)" in logs_qml
+    assert "model: App.logModel" in logs_qml
+    assert "onCountChanged:" in logs_qml
+    assert "positionViewAtEnd()" in logs_qml
+    assert "id: logStreamCard" not in logs_qml
+    assert "id: logLevelBadge" not in logs_qml
+    assert "В реальном времени" not in logs_qml
     assert "searchDebounce.restart()" in logs_qml
     assert "font.family: Theme.fontFamily" in logs_qml
 

@@ -26,15 +26,43 @@ def system_proxy_bypass_lan(controller: AppController, settings: AppSettings | N
     return bool(settings.system_proxy_bypass_lan)
 
 
+def _singbox_tun_runtime_signature(settings: AppSettings) -> dict[str, object]:
+    """Return settings that change the sing-box TUN runtime contract."""
+    proxy_auth_enabled = bool(getattr(settings, "proxy_auth_enabled", False))
+    return {
+        "enable_final_fragment": bool(getattr(settings, "enable_final_fragment", False)),
+        "fragment_packets": str(getattr(settings, "fragment_packets", "tlshello")),
+        "fragment_length": str(getattr(settings, "fragment_length", "50-100")),
+        "fragment_delay": str(getattr(settings, "fragment_delay", "10-20")),
+        "tail_fragment_enabled": bool(getattr(settings, "tail_fragment_enabled", False)),
+        "multiplex_enabled": bool(getattr(settings, "multiplex_enabled", False)),
+        "multiplex_concurrency": int(getattr(settings, "multiplex_concurrency", 8)),
+        "tun_strict_route": bool(getattr(settings, "tun_strict_route", False)),
+        "tun_stack": str(getattr(settings, "tun_stack", "mixed")),
+        "tun_mtu": int(getattr(settings, "tun_mtu", 9000)),
+        "tun_endpoint_independent_nat": bool(
+            getattr(settings, "tun_endpoint_independent_nat", False)
+        ),
+        "tun_block_quic": bool(getattr(settings, "tun_block_quic", True)),
+        "local_socks_port": int(getattr(settings, "local_socks_port", DEFAULT_SOCKS_PORT)),
+        "local_http_port": int(getattr(settings, "local_http_port", DEFAULT_HTTP_PORT)),
+        "proxy_auth_enabled": proxy_auth_enabled,
+        "proxy_auth_username": str(getattr(settings, "proxy_auth_username", "")) if proxy_auth_enabled else "",
+        "proxy_auth_password": str(getattr(settings, "proxy_auth_password", "")) if proxy_auth_enabled else "",
+    }
+
+
 def transition_signature(
     controller: AppController,
     node: Node | None = None,
     settings: AppSettings | None = None,
     routing: RoutingSettings | None = None,
+    *,
+    include_node: bool = True,
 ) -> str:
     settings = settings or controller.state.settings
     routing = routing or controller.state.routing
-    node = node or controller.selected_node
+    node = (node or controller.selected_node) if include_node else None
     if not settings.tun_mode and proxy_core_for_node(node) == "singbox":
         source_path, config_hash, has_proxy_outbound = controller._inspect_active_singbox_config()
         return signature(
@@ -75,6 +103,7 @@ def transition_signature(
             "regional_preset": str(getattr(settings, "regional_preset", "russia")),
             "discord_proxy_enabled": bool(settings.discord_proxy_enabled),
             "prefer_ipv6": bool(getattr(settings, "prefer_ipv6", False)),
+            "tun_runtime": _singbox_tun_runtime_signature(settings),
         }
         if planner_outcome == "hybrid_xray_sidecar":
             signature_payload["xray_path"] = str(settings.xray_path)
@@ -192,12 +221,15 @@ def tun_layer_signature(
     if not settings.tun_mode:
         return ""
     if controller.is_singbox_editor_mode(settings):
-        return transition_signature(controller, node, settings, routing)
+        return transition_signature(
+            controller,
+            settings=settings,
+            routing=routing,
+            include_node=False,
+        )
     return signature(
         {
             "mode": "singbox-native",
-            "node_id": node.id if node else None,
-            "node_outbound": (node.outbound if node else {}),
             "routing": routing.to_dict(),
             "xray_path": str(settings.xray_path),
             "singbox_path": str(settings.singbox_path),

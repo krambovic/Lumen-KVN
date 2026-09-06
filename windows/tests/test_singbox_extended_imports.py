@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
+import subprocess
 
 from xray_fluent.engines.singbox.config_builder import build_singbox_outbound
 from xray_fluent.engines.singbox.runtime_planner import parse_singbox_document, plan_singbox_runtime
+from xray_fluent.application.node_service import _maybe_base64_decode
 from xray_fluent.link_parser import (
     parse_links_text,
+    parse_single,
     repair_node_outbound_from_link,
     validate_node_outbound,
 )
@@ -24,6 +28,38 @@ def _base_config() -> dict:
         "route": {"rules": [], "final": "direct"},
         "dns": {"servers": [{"tag": "bootstrap-dns", "type": "udp", "server": "1.1.1.1"}]},
     }
+
+
+def test_vmess_base64_with_legacy_non_utf8_remark_still_imports() -> None:
+    payload = {
+        "v": "2",
+        "ps": "Сервер Ы",
+        "add": "example.com",
+        "port": "443",
+        "id": "00000000-0000-0000-0000-000000000000",
+        "aid": "0",
+        "net": "tcp",
+        "type": "none",
+        "tls": "tls",
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("cp1251")
+    ).decode("ascii")
+
+    nodes, errors = parse_links_text(f"vmess://{encoded}")
+
+    assert errors == []
+    assert nodes[0].server == "example.com"
+    assert nodes[0].name == "Сервер Ы"
+
+
+def test_base64_subscription_with_legacy_non_utf8_text_is_unwrapped() -> None:
+    raw = "vless://00000000-0000-0000-0000-000000000000@example.com:443#Сервер Ы".encode(
+        "cp1251"
+    )
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii")
+
+    assert _maybe_base64_decode(encoded) == raw.decode("cp1251")
 
 
 def test_mkcp_transport_is_converted_for_singbox_extended() -> None:
@@ -339,6 +375,169 @@ def test_awg_wgquick_config_normalizes_bare_addresses_and_awg20_fields() -> None
         "ip": "quic",
         "ib": "curl",
     }
+
+
+def test_awg3_wgquick_config_preserves_header_protection_and_timers() -> None:
+    header_key = base64.b64encode(bytes(range(32))).decode("ascii")
+    source = f"""
+        [Interface]
+        PrivateKey = {base64.b64encode(bytes([1] * 32)).decode("ascii")}
+        Address = 10.9.0.120/32
+        DNS = 1.1.1.1, 1.0.0.1
+        MTU = 1420
+        Jc = 8
+        Jmin = 82
+        Jmax = 289
+        S1 = 59
+        S2 = 25
+        S3 = 19
+        S4 = 14
+        H1 = 100016672-100016772
+        H2 = 600002096-600002196
+        H3 = 1100030931-1100031031
+        H4 = 1600001288-1600001388
+        I1 = <b 0x01020304>
+        HeaderProtectionKey = {header_key}
+        ContentPaddingAddition = 0-110
+        RekeyAfterTime = 120
+        RekeyTimeout = 5-8
+        RejectAfterTime = 180
+        KeepaliveTimeout = 10
+        MaxHandshakeAttempts = 18
+
+        [Peer]
+        PublicKey = {base64.b64encode(bytes([2] * 32)).decode("ascii")}
+        Endpoint = 203.0.113.10:44553
+        AllowedIPs = 0.0.0.0/0
+        PersistentKeepalive = 25
+    """
+
+    nodes, errors = parse_links_text(source)
+
+    assert errors == []
+    assert len(nodes) == 1
+    node = nodes[0]
+    outbound = build_singbox_outbound(node, tag="proxy")
+    amnezia = outbound["amnezia"]
+    assert node.scheme == "awg"
+    assert amnezia["header_protection_key"] == header_key
+    assert amnezia["content_padding_addition"] == "0-110"
+    assert amnezia["rekey_after_time"] == 120
+    assert amnezia["rekey_timeout"] == "5-8"
+    assert amnezia["reject_after_time"] == 180
+    assert amnezia["keepalive_timeout"] == 10
+    assert amnezia["max_handshake_attempts"] == 18
+    assert validate_node_outbound(node) is None
+
+
+def test_awg31_wgquick_config_preserves_the_extended_transport_fields() -> None:
+    header_key = base64.b64encode(bytes(range(32))).decode("ascii")
+    source = f"""
+        [Interface]
+        PrivateKey = {base64.b64encode(bytes([1] * 32)).decode("ascii")}
+        Address = 10.9.0.121/32
+        MTU = 1280
+        Jc = 6
+        Jmin = 10
+        Jmax = 50
+        S1 = 95
+        S2 = 86
+        S3 = 33
+        S4 = 12
+        H1 = 134567-245678
+        H2 = 3456789-4567890
+        H3 = 56789012-67890123
+        H4 = 456789012-567890123
+        I1 = <b 0x01020304>
+        I2 = <b 0x05060708>
+        I3 = <b 0x090a0b0c>
+        I4 = <b 0x0d0e0f10>
+        I5 = <b 0x11121314>
+        HeaderProtectionKey = {header_key}
+        ContentPaddingAddition = 10-100
+        RekeyAfterTime = 100-120
+        RekeyTimeout = 5-8
+        RejectAfterTime = 180-200
+        KeepaliveTimeout = 10-15
+        MaxHandshakeAttempts = 5-8
+
+        [Peer]
+        PublicKey = {base64.b64encode(bytes([2] * 32)).decode("ascii")}
+        Endpoint = 198.51.100.10:51820
+        AllowedIPs = 0.0.0.0/0, ::/0
+        PersistentKeepalive = 25
+    """
+
+    nodes, errors = parse_links_text(source)
+
+    assert errors == []
+    assert len(nodes) == 1
+    amnezia = build_singbox_outbound(nodes[0], tag="proxy")["amnezia"]
+    assert nodes[0].scheme == "awg"
+    assert amnezia["i2"] == "<b 0x05060708>"
+    assert amnezia["i5"] == "<b 0x11121314>"
+    assert amnezia["header_protection_key"] == header_key
+    assert amnezia["content_padding_addition"] == "10-100"
+    assert amnezia["rekey_after_time"] == "100-120"
+    assert amnezia["rekey_timeout"] == "5-8"
+    assert amnezia["reject_after_time"] == "180-200"
+    assert amnezia["keepalive_timeout"] == "10-15"
+    assert amnezia["max_handshake_attempts"] == "5-8"
+    assert validate_node_outbound(nodes[0]) is None
+
+
+def test_awg3_runtime_config_is_accepted_by_delivered_singbox_core(tmp_path) -> None:
+    core = Path(__file__).parents[1] / "core" / "sing-box.exe"
+    if not core.is_file():
+        pytest.skip("delivered sing-box core is not present")
+
+    header_key = base64.b64encode(bytes(range(32))).decode("ascii")
+    source = f"""
+        [Interface]
+        PrivateKey = {base64.b64encode(bytes([1] * 32)).decode("ascii")}
+        Address = 10.9.0.120/32
+        MTU = 1420
+        Jc = 8
+        Jmin = 82
+        Jmax = 289
+        S1 = 59
+        S2 = 25
+        S3 = 19
+        S4 = 14
+        H1 = 100016672-100016772
+        H2 = 600002096-600002196
+        H3 = 1100030931-1100031031
+        H4 = 1600001288-1600001388
+        HeaderProtectionKey = {header_key}
+        ContentPaddingAddition = 0-110
+
+        [Peer]
+        PublicKey = {base64.b64encode(bytes([2] * 32)).decode("ascii")}
+        Endpoint = 203.0.113.10:44553
+        AllowedIPs = 0.0.0.0/0
+    """
+    nodes, errors = parse_links_text(source)
+    assert errors == []
+
+    template_path = Path(__file__).parents[1] / "data" / "templates" / "sing-box" / "default.json"
+    document = parse_singbox_document(template_path, template_path.read_text(encoding="utf-8"))
+    plan = plan_singbox_runtime(
+        document,
+        nodes[0],
+        routing=RoutingSettings(mode="global", tun_default_outbound="proxy"),
+        tun_mode=True,
+    )
+    config_path = tmp_path / "awg3-runtime.json"
+    config_path.write_text(json.dumps(plan.singbox_config), encoding="utf-8")
+    result = subprocess.run(
+        [str(core), "check", "-c", str(config_path), "-D", str(core.parent)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_legacy_awg_wgquick_node_is_migrated_before_runtime() -> None:
@@ -1004,3 +1203,18 @@ proxy-groups:
     urltest = next(item for item in config["outbounds"] if item.get("type") == "urltest")
     assert urltest["outbounds"] == ["wg-auto-1-1", "wg-auto-1-2"]
     assert urltest["interval"] == "60s"
+
+
+def test_runtime_omits_deprecated_independent_dns_cache_option() -> None:
+    node = parse_single(
+        "vless://00000000-0000-0000-0000-000000000000@example.com:443#latest-core"
+    )
+    document = parse_singbox_document(Path("default.json"), json.dumps(_base_config()))
+
+    runtime = plan_singbox_runtime(
+        document,
+        node,
+        routing=RoutingSettings(mode="global", tun_default_outbound="proxy"),
+    ).singbox_config
+
+    assert "independent_cache" not in runtime["dns"]

@@ -13,6 +13,8 @@ from xray_fluent.engines.singbox.runtime_planner import (
     classify_node_for_singbox,
     parse_singbox_document,
     plan_singbox_runtime,
+    singbox_node_source_signature,
+    singbox_node_tag,
 )
 from xray_fluent.models import Node, RoutingSettings
 
@@ -296,6 +298,34 @@ def test_proxy_runtime_removes_tun_and_keeps_local_proxy_inbounds() -> None:
     assert any(
         rule.get("inbound") == ["socks-in", "http-in"]
         and rule.get("outbound") == "proxy"
+        for rule in config["route"]["rules"]
+    )
+
+
+@pytest.mark.parametrize(
+    "legacy_routing",
+    [
+        {"mode": "global", "preset_id": "blocked"},
+        {"mode": "global", "proxy_domains": ["geosite:ru-blocked"]},
+    ],
+)
+def test_awg_proxy_runtime_keeps_blocked_preset_direct_fallback_after_legacy_state(
+    legacy_routing: dict,
+) -> None:
+    routing = RoutingSettings.from_dict(legacy_routing)
+
+    assert routing.mode == "rule"
+    config = _plan(
+        routing,
+        node=_wireguard_node("198.51.100.10"),
+        tun_mode=False,
+        enable_final_fragment=False,
+    )
+
+    assert config["route"]["final"] == "direct"
+    assert any(
+        rule.get("outbound") == "proxy"
+        and "geosite-ru-blocked" in rule.get("rule_set", [])
         for rule in config["route"]["rules"]
     )
 
@@ -1132,3 +1162,43 @@ def test_planner_runtime_error_is_reported_as_a_connection_error() -> None:
     assert operations.start_runtime(controller, None, prev_active_core="xray", tun_mode=True) is None
     assert controller._active_core == "xray"
     assert statuses == [("error", "Не найден региональный rule-set geosite:ru-blocked.")]
+
+
+def test_hot_switch_selector_contains_native_nodes_and_skips_hybrid_nodes() -> None:
+    first = _node_with_server("first.example.com")
+    first.id = "first-node"
+    second = _node_with_server("second.example.com")
+    second.id = "second-node"
+    hybrid = Node(
+        id="hybrid-node",
+        name="Hybrid",
+        scheme="vmess",
+        server="hybrid.example.com",
+        port=443,
+        outbound={
+            "protocol": "vmess",
+            "settings": {"vnext": [{"address": "hybrid.example.com", "port": 443}]},
+            "streamSettings": {"network": "xhttp"},
+        },
+    )
+
+    document = parse_singbox_document(Path("test.json"), json.dumps(_base_config()))
+    plan = plan_singbox_runtime(
+        document,
+        first,
+        routing=RoutingSettings(mode="global", tun_default_outbound="proxy"),
+        enable_hot_switch=True,
+        hot_switch_nodes=(first, second, hybrid),
+    )
+
+    assert plan.clash_api_selector == "proxy"
+    selector = next(item for item in plan.singbox_config["outbounds"] if item.get("tag") == "proxy")
+    assert selector["type"] == "selector"
+    assert selector["default"] in selector["outbounds"]
+    assert len(selector["outbounds"]) == 2
+    assert singbox_node_tag(hybrid.id) not in selector["outbounds"]
+    assert dict(plan.clash_api_node_signatures) == {
+        first.id: singbox_node_source_signature(first),
+        second.id: singbox_node_source_signature(second),
+    }
+    assert not any(item.get("tag") == "proxy" and item.get("type") != "selector" for item in plan.singbox_config["outbounds"])

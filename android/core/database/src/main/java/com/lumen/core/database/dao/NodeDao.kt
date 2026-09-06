@@ -17,6 +17,9 @@ interface NodeDao {
     @Query("SELECT * FROM nodes WHERE id = :id")
     fun getNodeById(id: String): Flow<NodeEntity?>
 
+    @Query("SELECT * FROM nodes WHERE id IN (:ids)")
+    suspend fun getNodesByIds(ids: List<String>): List<NodeEntity>
+
     @Query("SELECT * FROM nodes WHERE subscriptionId = :subscriptionId")
     fun getNodesForSubscription(subscriptionId: String): Flow<List<NodeEntity>>
 

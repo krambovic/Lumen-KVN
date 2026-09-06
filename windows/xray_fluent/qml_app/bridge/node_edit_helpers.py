@@ -118,6 +118,8 @@ def _protocol_from_node(node) -> str:
         "socks5": "socks",
         "hy": "hysteria",
         "hy2": "hysteria2",
+        "mierus": "mieru",
+        "any-tls": "anytls",
         "wg": "wireguard",
     }.get(protocol, protocol)
 
@@ -148,6 +150,14 @@ def _field_capabilities(protocol: str) -> dict[str, bool | str]:
 
 def _share_query(params: dict[str, str]) -> str:
     return "&".join(f"{quote(key)}={quote(value, safe='')}" for key, value in params.items() if value != "")
+
+
+def _share_host(server: Any) -> str:
+    """Format a host for URI authority syntax (including IPv6 literals)."""
+    value = str(server or "").strip()
+    if ":" in value and not value.startswith("["):
+        return f"[{value}]"
+    return value
 
 
 def _share_network(stream: dict[str, Any]) -> str:
@@ -227,7 +237,49 @@ def _native_share_tls_params(params: dict[str, str], native: dict[str, Any]) -> 
         _set_param(params, "insecure", "1" if tls.get("insecure") is True else "0")
 
 
+def _native_share_transport_params(native: dict[str, Any]) -> dict[str, str]:
+    """Convert sing-box transport/TLS fields to the common share URI query."""
+    transport = native.get("transport") if isinstance(native.get("transport"), dict) else {}
+    transport_type = str(transport.get("type") or "tcp").strip().lower()
+    params: dict[str, str] = {"type": "tcp" if transport_type in {"", "raw"} else transport_type}
+    path = transport.get("path")
+    _set_param(params, "path", path)
+    host = transport.get("host")
+    if isinstance(host, list):
+        _set_param(params, "host", ",".join(str(item) for item in host))
+    else:
+        _set_param(params, "host", host)
+    headers = transport.get("headers") if isinstance(transport.get("headers"), dict) else {}
+    _set_param(params, "host", headers.get("Host") or headers.get("host") or params.get("host", ""))
+    _set_param(params, "serviceName", transport.get("service_name") or transport.get("serviceName"))
+    _set_param(params, "mode", transport.get("mode"))
+
+    tls = native.get("tls") if isinstance(native.get("tls"), dict) else {}
+    reality = tls.get("reality") if isinstance(tls.get("reality"), dict) else {}
+    if reality.get("enabled") or reality:
+        params["security"] = "reality"
+        _set_param(params, "pbk", reality.get("public_key") or reality.get("publicKey"))
+        _set_param(params, "sid", reality.get("short_id") or reality.get("shortId"))
+        _set_param(params, "spx", reality.get("spider_x") or reality.get("spiderX"))
+    elif tls.get("enabled") is not False and tls:
+        params["security"] = "tls"
+    _set_param(params, "sni", tls.get("server_name") or tls.get("serverName"))
+    alpn = tls.get("alpn")
+    _set_param(params, "alpn", ",".join(str(item) for item in alpn) if isinstance(alpn, list) else alpn)
+    if "insecure" in tls:
+        _set_param(params, "insecure", "1" if tls.get("insecure") is True else "0")
+    return params
+
+
 def _build_vless_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
+    native = _native_payload(outbound)
+    if native:
+        params = _native_share_transport_params(native)
+        _set_param(params, "encryption", str(native.get("encryption") or "none"))
+        _set_param(params, "flow", str(native.get("flow") or ""))
+        user_id = str(native.get("uuid") or native.get("id") or "")
+        fragment = quote(name, safe="")
+        return f"vless://{quote(user_id, safe='')}@{_share_host(native.get('server') or server)}:{int(native.get('server_port') or port)}?{_share_query(params)}#{fragment}"
     settings = outbound.get("settings") if isinstance(outbound.get("settings"), dict) else {}
     vnext = _first_dict(settings.get("vnext"))
     user = _first_dict(vnext.get("users"))
@@ -240,10 +292,31 @@ def _build_vless_link(name: str, server: str, port: int, outbound: dict[str, Any
     _set_param(params, "flow", str(user.get("flow") or ""))
     params.update(_stream_share_params(stream))
     fragment = quote(name, safe="")
-    return f"vless://{quote(user_id, safe='')}@{server}:{port}?{_share_query(params)}#{fragment}"
+    return f"vless://{quote(user_id, safe='')}@{_share_host(server)}:{port}?{_share_query(params)}#{fragment}"
 
 
 def _build_vmess_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
+    native = _native_payload(outbound)
+    if native:
+        params = _native_share_transport_params(native)
+        payload: dict[str, str] = {
+            "v": "2",
+            "ps": name,
+            "add": str(native.get("server") or server),
+            "port": str(native.get("server_port") or port),
+            "id": str(native.get("uuid") or native.get("id") or ""),
+            "aid": str(native.get("alter_id") or native.get("alterId") or 0),
+            "scy": str(native.get("security") or "auto"),
+            "net": params.get("type", "tcp"),
+            "type": params.get("headerType", "none"),
+            "host": params.get("host", ""),
+            "path": params.get("path", "") or params.get("serviceName", ""),
+            "tls": "tls" if params.get("security") in {"tls", "reality"} else "",
+            "sni": params.get("sni", ""),
+            "alpn": params.get("alpn", ""),
+        }
+        encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).decode("ascii")
+        return f"vmess://{encoded}"
     settings = outbound.get("settings") if isinstance(outbound.get("settings"), dict) else {}
     vnext = _first_dict(settings.get("vnext"))
     user = _first_dict(vnext.get("users"))
@@ -277,6 +350,15 @@ def _build_vmess_link(name: str, server: str, port: int, outbound: dict[str, Any
 
 
 def _build_trojan_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
+    native = _native_payload(outbound)
+    if native:
+        params = _native_share_transport_params(native)
+        # Trojan URI parsers default to TLS; preserve an explicitly disabled
+        # native TLS block as ``security=none``.
+        params.setdefault("security", "none")
+        password = quote(str(native.get("password") or ""), safe="")
+        fragment = quote(name, safe="")
+        return f"trojan://{password}@{_share_host(native.get('server') or server)}:{int(native.get('server_port') or port)}?{_share_query(params)}#{fragment}"
     settings = outbound.get("settings") if isinstance(outbound.get("settings"), dict) else {}
     server_item = _first_dict(settings.get("servers"))
     stream = outbound.get("streamSettings") if isinstance(outbound.get("streamSettings"), dict) else {}
@@ -285,10 +367,19 @@ def _build_trojan_link(name: str, server: str, port: int, outbound: dict[str, An
     params.setdefault("security", "none")
     fragment = quote(name, safe="")
     password = quote(str(server_item.get("password") or ""), safe="")
-    return f"trojan://{password}@{server}:{port}?{_share_query(params)}#{fragment}"
+    return f"trojan://{password}@{_share_host(server)}:{port}?{_share_query(params)}#{fragment}"
 
 
 def _build_shadowsocks_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
+    native = _native_payload(outbound)
+    if native:
+        credentials = f"{native.get('method') or ''}:{native.get('password') or ''}"
+        encoded = base64.urlsafe_b64encode(credentials.encode("utf-8")).decode("ascii").rstrip("=")
+        params: dict[str, str] = {}
+        _set_param(params, "plugin", str(native.get("plugin") or ""))
+        fragment = quote(name, safe="")
+        query = _share_query(params)
+        return f"ss://{encoded}@{_share_host(native.get('server') or server)}:{int(native.get('server_port') or port)}{'?' + query if query else ''}#{fragment}"
     settings = outbound.get("settings") if isinstance(outbound.get("settings"), dict) else {}
     server_item = _first_dict(settings.get("servers"))
     credentials = f"{server_item.get('method') or ''}:{server_item.get('password') or ''}"
@@ -297,10 +388,17 @@ def _build_shadowsocks_link(name: str, server: str, port: int, outbound: dict[st
     _set_param(params, "plugin", str(server_item.get("plugin") or ""))
     query = _share_query(params)
     fragment = quote(name, safe="")
-    return f"ss://{encoded}@{server}:{port}{'?' + query if query else ''}#{fragment}"
+    return f"ss://{encoded}@{_share_host(server)}:{port}{'?' + query if query else ''}#{fragment}"
 
 
 def _build_socks_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
+    native = _native_payload(outbound)
+    if native:
+        username = str(native.get("username") or "")
+        password = str(native.get("password") or "")
+        credentials = f"{quote(username, safe='')}:{quote(password, safe='')}@" if username else ""
+        fragment = quote(name, safe="")
+        return f"socks://{credentials}{_share_host(native.get('server') or server)}:{int(native.get('server_port') or port)}#{fragment}"
     settings = outbound.get("settings") if isinstance(outbound.get("settings"), dict) else {}
     server_item = _first_dict(settings.get("servers"))
     user = _first_dict(server_item.get("users"))
@@ -309,7 +407,52 @@ def _build_socks_link(name: str, server: str, port: int, outbound: dict[str, Any
     if username:
         credentials = f"{quote(username, safe='')}:{quote(str(user.get('pass') or ''), safe='')}@"
     fragment = quote(name, safe="")
-    return f"socks://{credentials}{server}:{port}#{fragment}"
+    return f"socks://{credentials}{_share_host(server)}:{port}#{fragment}"
+
+
+def _build_http_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
+    native = _native_payload(outbound)
+    if native:
+        username = str(native.get("username") or "")
+        password = str(native.get("password") or "")
+        credentials = f"{quote(username, safe='')}:{quote(password, safe='')}@" if username else ""
+        fragment = quote(name, safe="")
+        return f"http://{credentials}{_share_host(native.get('server') or server)}:{int(native.get('server_port') or port)}#{fragment}"
+    settings = outbound.get("settings") if isinstance(outbound.get("settings"), dict) else {}
+    server_item = _first_dict(settings.get("servers"))
+    user = _first_dict(server_item.get("users"))
+    username = str(user.get("user") or "")
+    password = str(user.get("pass") or "")
+    credentials = f"{quote(username, safe='')}:{quote(password, safe='')}@" if username else ""
+    fragment = quote(name, safe="")
+    return f"http://{credentials}{_share_host(server)}:{port}#{fragment}"
+
+
+def _build_hysteria_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
+    native = _native_payload(outbound)
+    params: dict[str, str] = {}
+    _native_share_tls_params(params, native)
+    _set_param(params, "protocol", native.get("protocol"))
+    _set_param(params, "upmbps", native.get("up_mbps"))
+    _set_param(params, "downmbps", native.get("down_mbps"))
+    ports = native.get("server_ports")
+    _set_param(params, "server_ports", ",".join(str(item) for item in ports) if isinstance(ports, list) else ports)
+    _set_param(params, "hop_interval", native.get("hop_interval"))
+    for key in ("recv_window_conn", "recv_window", "disable_mtu_discovery"):
+        value = native.get(key)
+        if key == "disable_mtu_discovery":
+            _set_param(params, key, "1" if value is True else "")
+        else:
+            _set_param(params, key, value)
+    obfs = native.get("obfs")
+    if isinstance(obfs, dict):
+        _set_param(params, "obfs", obfs.get("type"))
+        _set_param(params, "obfs-password", obfs.get("password"))
+    elif obfs:
+        _set_param(params, "obfs", obfs)
+    fragment = quote(name, safe="")
+    auth = quote(str(native.get("auth_str") or native.get("password") or ""), safe="")
+    return f"hysteria://{auth}@{_share_host(native.get('server') or server)}:{int(native.get('server_port') or port)}?{_share_query(params)}#{fragment}"
 
 
 def _build_hysteria2_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
@@ -320,9 +463,20 @@ def _build_hysteria2_link(name: str, server: str, port: int, outbound: dict[str,
     if isinstance(obfs, dict):
         _set_param(params, "obfs", str(obfs.get("type") or ""))
         _set_param(params, "obfs-password", str(obfs.get("password") or ""))
+    ports = native.get("server_ports")
+    _set_param(params, "server_ports", ",".join(str(item) for item in ports) if isinstance(ports, list) else ports)
+    _set_param(params, "hop_interval", native.get("hop_interval"))
+    _set_param(params, "upmbps", native.get("up_mbps"))
+    _set_param(params, "downmbps", native.get("down_mbps"))
+    for key in ("recv_window_conn", "recv_window", "disable_mtu_discovery"):
+        value = native.get(key)
+        if key == "disable_mtu_discovery":
+            _set_param(params, key, "1" if value is True else "")
+        else:
+            _set_param(params, key, value)
     fragment = quote(name, safe="")
     password = quote(str(native.get("password") or ""), safe="")
-    return f"hysteria2://{password}@{server}:{port}?{_share_query(params)}#{fragment}"
+    return f"hysteria2://{password}@{_share_host(native.get('server') or server)}:{int(native.get('server_port') or port)}?{_share_query(params)}#{fragment}"
 
 
 def _build_tuic_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
@@ -338,11 +492,138 @@ def _build_tuic_link(name: str, server: str, port: int, outbound: dict[str, Any]
     password = str(native.get("password") or "")
     if password:
         credentials = f"{credentials}:{quote(password, safe='')}"
-    return f"tuic://{credentials}@{server}:{port}?{_share_query(params)}#{fragment}"
+    return f"tuic://{credentials}@{_share_host(native.get('server') or server)}:{int(native.get('server_port') or port)}?{_share_query(params)}#{fragment}"
 
 
-# Protocols with a portable share URI; everything else keeps the canonical JSON form,
-# which link_parser also accepts but no other client can read.
+def _build_mieru_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
+    native = _native_payload(outbound)
+    username = quote(str(native.get("username") or ""), safe="")
+    password = quote(str(native.get("password") or ""), safe="")
+    params: dict[str, str] = {"transport": str(native.get("transport") or "TCP").upper()}
+    ports = native.get("server_ports")
+    if isinstance(ports, list):
+        _set_param(params, "server_ports", ",".join(str(item) for item in ports))
+    else:
+        _set_param(params, "server_ports", ports)
+    _set_param(params, "multiplexing", native.get("multiplexing"))
+    _set_param(params, "traffic_pattern", native.get("traffic_pattern"))
+    fragment = quote(name, safe="")
+    authority_port = int(native.get("server_port") or port or 0)
+    authority = _share_host(native.get("server") or server)
+    if authority_port:
+        authority += f":{authority_port}"
+    return f"mieru://{username}:{password}@{authority}?{_share_query(params)}#{fragment}"
+
+
+def _build_naive_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
+    native = _native_payload(outbound)
+    scheme = "naive+quic" if native.get("quic") is True else "naive"
+    username = quote(str(native.get("username") or ""), safe="")
+    password = quote(str(native.get("password") or ""), safe="")
+    credentials = f"{username}:{password}@" if username or password else ""
+    params: dict[str, str] = {}
+    tls = native.get("tls") if isinstance(native.get("tls"), dict) else {}
+    _set_param(params, "sni", tls.get("server_name") or "")
+    _set_param(params, "insecure_concurrency", native.get("insecure_concurrency"))
+    _set_param(params, "quic_congestion_control", native.get("quic_congestion_control"))
+    if native.get("udp_over_tcp") not in (None, False, ""):
+        value = native["udp_over_tcp"]
+        _set_param(params, "udp_over_tcp", value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    if isinstance(native.get("extra_headers"), dict):
+        _set_param(params, "extra_headers", json.dumps(native["extra_headers"], ensure_ascii=False, separators=(",", ":")))
+    fragment = quote(name, safe="")
+    return f"{scheme}://{credentials}{_share_host(native.get('server') or server)}:{int(native.get('server_port') or port or 443)}?{_share_query(params)}#{fragment}"
+
+
+def _build_anytls_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
+    native = _native_payload(outbound)
+    params: dict[str, str] = {}
+    tls = native.get("tls") if isinstance(native.get("tls"), dict) else {}
+    _set_param(params, "sni", tls.get("server_name") or "")
+    if tls.get("insecure") is True:
+        _set_param(params, "insecure", "1")
+    alpn = tls.get("alpn")
+    _set_param(params, "alpn", ",".join(str(item) for item in alpn) if isinstance(alpn, list) else alpn)
+    pins = tls.get("certificate_public_key_sha256")
+    _set_param(params, "pinsha256", ",".join(str(item) for item in pins) if isinstance(pins, list) else pins)
+    for key in ("idle_session_check_interval", "idle_session_timeout", "min_idle_session"):
+        _set_param(params, key, native.get(key))
+    password = quote(str(native.get("password") or ""), safe="")
+    fragment = quote(name, safe="")
+    return f"anytls://{password}@{_share_host(native.get('server') or server)}:{int(native.get('server_port') or port or 443)}?{_share_query(params)}#{fragment}"
+
+
+def _build_wireguard_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
+    native = _native_payload(outbound)
+    protocol = str(outbound.get("protocol") or "wireguard").lower()
+    native_type = str(native.get("type") or protocol).lower()
+    if native_type == "warp" or protocol == "warp":
+        scheme = "awg" if protocol == "awg" or isinstance(native.get("amnezia"), dict) else "warp"
+        profile = native.get("profile") if isinstance(native.get("profile"), dict) else {}
+        params: dict[str, str] = {}
+        for key in ("id", "private_key", "auth_token", "listen_port", "persistent_keepalive_interval", "udp_timeout"):
+            _set_param(params, key, profile.get(key) if key in profile else native.get(key))
+        amnezia = native.get("amnezia")
+        if isinstance(amnezia, dict):
+            for key, value in amnezia.items():
+                _set_param(params, key, value)
+        dns = outbound.get("_dns")
+        _set_param(params, "dns", ",".join(str(item) for item in dns) if isinstance(dns, list) else dns)
+        fragment = quote(name, safe="")
+        return f"{scheme}://engage.cloudflareclient.com:2408?{_share_query(params)}#{fragment}"
+
+    peers = native.get("peers") if isinstance(native.get("peers"), list) else []
+    peer = peers[0] if peers and isinstance(peers[0], dict) else {}
+    endpoint_server = str(peer.get("address") or peer.get("server") or native.get("server") or server)
+    endpoint_port = int(peer.get("port") or peer.get("server_port") or native.get("server_port") or port or 51820)
+    params: dict[str, str] = {}
+    _set_param(params, "public_key", peer.get("public_key") or peer.get("publicKey"))
+    addresses = native.get("address") or native.get("addresses")
+    _set_param(params, "address", ",".join(str(item) for item in addresses) if isinstance(addresses, list) else addresses)
+    allowed = peer.get("allowed_ips") or peer.get("allowedIPs") or native.get("allowed_ips")
+    _set_param(params, "allowed_ips", ",".join(str(item) for item in allowed) if isinstance(allowed, list) else allowed)
+    _set_param(params, "pre_shared_key", peer.get("pre_shared_key") or peer.get("preshared_key"))
+    _set_param(params, "persistent_keepalive", peer.get("persistent_keepalive_interval") or peer.get("persistent_keepalive"))
+    for key in ("mtu", "listen_port", "udp_timeout", "workers", "preallocated_buffers_per_pool", "disable_pauses"):
+        _set_param(params, key, native.get(key))
+    dns = outbound.get("_dns")
+    _set_param(params, "dns", ",".join(str(item) for item in dns) if isinstance(dns, list) else dns)
+    amnezia = native.get("amnezia")
+    if isinstance(amnezia, dict):
+        for key, value in amnezia.items():
+            _set_param(params, key, value)
+    private_key = quote(str(native.get("private_key") or ""), safe="")
+    scheme = "awg" if protocol == "awg" or isinstance(amnezia, dict) else "wireguard"
+    fragment = quote(name, safe="")
+    return f"{scheme}://{private_key}@{_share_host(endpoint_server)}:{endpoint_port}?{_share_query(params)}#{fragment}"
+
+
+def _build_masque_link(name: str, server: str, port: int, outbound: dict[str, Any]) -> str:
+    native = _native_payload(outbound)
+    profile = native.get("profile") if isinstance(native.get("profile"), dict) else {}
+    profile_id = str(profile.get("id") or server or "")
+    token = quote(str(profile.get("auth_token") or ""), safe="")
+    credentials = f"{token}@" if token else ""
+    params: dict[str, str] = {
+        "name": str(native.get("name") or "masque0"),
+        "system": "true" if native.get("system") is True else "false",
+        "use_http2": "true" if native.get("use_http2") is True else "false",
+        "use_ipv6": "true" if native.get("use_ipv6") is True else "false",
+    }
+    allowed = native.get("allowed_ips")
+    _set_param(params, "allowed_ips", ",".join(str(item) for item in allowed) if isinstance(allowed, list) else allowed)
+    _set_param(params, "sni", (native.get("tls") or {}).get("server_name") if isinstance(native.get("tls"), dict) else "")
+    if isinstance(native.get("tls"), dict) and native["tls"].get("insecure") is True:
+        _set_param(params, "insecure", "true")
+    for key in ("udp_timeout", "udp_keepalive_period", "reconnect_delay", "congestion_controller"):
+        _set_param(params, key, native.get(key))
+    fragment = quote(name, safe="")
+    return f"masque://{credentials}{quote(profile_id, safe='')}?{_share_query(params)}#{fragment}"
+
+
+# Protocols with a portable share URI used by the node editor.  Keep this
+# compatibility set stable: native-only editor saves historically retained
+# canonical JSON in ``node.link``.
 _SHARE_LINK_BUILDERS = {
     "vless": _build_vless_link,
     "vmess": _build_vmess_link,
@@ -351,6 +632,22 @@ _SHARE_LINK_BUILDERS = {
     "socks": _build_socks_link,
     "hysteria2": _build_hysteria2_link,
     "tuic": _build_tuic_link,
+}
+
+# Export-only normalizers cover every protocol for which link_parser has a
+# lossless URI representation.  Full Xray/sing-box/OpenVPN documents and
+# custom protocols intentionally fall back to compact JSON.
+_EXPORT_LINK_BUILDERS = {
+    **_SHARE_LINK_BUILDERS,
+    "http": _build_http_link,
+    "hysteria": _build_hysteria_link,
+    "mieru": _build_mieru_link,
+    "naive": _build_naive_link,
+    "anytls": _build_anytls_link,
+    "wireguard": _build_wireguard_link,
+    "awg": _build_wireguard_link,
+    "warp": _build_wireguard_link,
+    "masque": _build_masque_link,
 }
 
 
@@ -364,6 +661,100 @@ def _build_node_link(protocol: str, name: str, server: str, port: int, outbound:
 def _native_payload(outbound: dict[str, Any]) -> dict[str, Any]:
     native = outbound.get("singbox")
     return native if isinstance(native, dict) else {}
+
+
+def _share_identity_present(protocol: str, outbound: dict[str, Any]) -> bool:
+    """Return whether a portable URI can be produced without empty credentials."""
+    native = _native_payload(outbound)
+    if native:
+        if protocol in {"vless", "vmess"}:
+            return bool(native.get("uuid") or native.get("id"))
+        if protocol == "trojan":
+            return bool(native.get("password"))
+        if protocol == "shadowsocks":
+            return bool(native.get("method") and native.get("password"))
+        if protocol in {"hysteria", "hysteria2"}:
+            return bool(native.get("auth_str") or native.get("password"))
+        if protocol == "tuic":
+            return bool(native.get("uuid"))
+        if protocol == "mieru":
+            return bool(native.get("username") and native.get("password"))
+        if protocol == "anytls":
+            return bool(native.get("password"))
+        if protocol in {"wireguard", "awg"}:
+            peers = native.get("peers") if isinstance(native.get("peers"), list) else []
+            peer = peers[0] if peers and isinstance(peers[0], dict) else {}
+            return bool(native.get("private_key") and (peer.get("public_key") or peer.get("publicKey")))
+        if protocol == "warp":
+            profile = native.get("profile") if isinstance(native.get("profile"), dict) else {}
+            return bool(profile.get("id") or profile.get("private_key") or profile.get("auth_token"))
+        if protocol == "masque":
+            profile = native.get("profile") if isinstance(native.get("profile"), dict) else {}
+            # The URI form represents a registered profile.  Direct MASQUE
+            # endpoints carry tunnel keys/addresses that the URI parser cannot
+            # reconstruct, so retain those as JSON instead of dropping them.
+            direct_fields = ("private_key", "public_key", "address", "server", "server_port")
+            if any(native.get(key) not in (None, "", [], {}) for key in direct_fields):
+                return False
+            if profile.get("private_key"):
+                return False
+            return bool(profile.get("id"))
+    if protocol in {"vless", "vmess"}:
+        settings = outbound.get("settings") if isinstance(outbound.get("settings"), dict) else {}
+        user = _first_dict(_first_dict(settings.get("vnext")).get("users"))
+        return bool(user.get("id"))
+    if protocol == "trojan":
+        settings = outbound.get("settings") if isinstance(outbound.get("settings"), dict) else {}
+        return bool(_first_dict(settings.get("servers")).get("password"))
+    if protocol == "shadowsocks":
+        settings = outbound.get("settings") if isinstance(outbound.get("settings"), dict) else {}
+        server_item = _first_dict(settings.get("servers"))
+        return bool(server_item.get("method") and server_item.get("password"))
+    return True
+
+
+def normalized_node_export_link(node) -> str:
+    """Return a portable, canonical share link for a node when one exists.
+
+    Imported JSON nodes retain their source document in ``node.link`` for
+    round-trip safety.  Share actions should instead expose the protocol URI
+    generated from the normalized outbound.  Full sing-box/Xray/OpenVPN
+    documents have no lossless single-URI representation and therefore keep a
+    compact JSON form (or their original non-URI payload).
+    """
+    if node is None:
+        return ""
+    raw = str(getattr(node, "link", "") or "").strip()
+    outbound = getattr(node, "outbound", None)
+    outbound = outbound if isinstance(outbound, dict) else {}
+    protocol = _protocol_from_node(node)
+    builder = _EXPORT_LINK_BUILDERS.get(protocol)
+    name = str(getattr(node, "name", "") or "").strip()
+    server = str(getattr(node, "server", "") or "").strip()
+    try:
+        port = int(getattr(node, "port", 0) or 0)
+    except (TypeError, ValueError):
+        port = 0
+    native = _native_payload(outbound)
+    effective_server = server or str(native.get("server") or "")
+    if not effective_server and protocol in {"wireguard", "awg"}:
+        peers = native.get("peers") if isinstance(native.get("peers"), list) else []
+        if peers and isinstance(peers[0], dict):
+            effective_server = str(peers[0].get("address") or peers[0].get("server") or "")
+    endpoint_available = protocol in {"warp", "masque"} or bool(effective_server)
+    if builder is not None and endpoint_available and _share_identity_present(protocol, outbound):
+        try:
+            candidate = str(builder(name, server, port, outbound) or "").strip()
+        except Exception:
+            candidate = ""
+        if candidate and "://" in candidate and not candidate.startswith("{"):
+            return candidate
+    if raw.startswith("{"):
+        try:
+            return json.dumps(json.loads(raw), ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            pass
+    return raw
 
 
 def _text_list(value: Any) -> str:
@@ -505,7 +896,21 @@ def _native_tls_fields(values: dict[str, Any]) -> list[dict[str, Any]]:
 _AMNEZIA_EDITOR_KEYS = (
     "jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4",
     "i1", "i2", "i3", "i4", "i5", "j1", "j2", "j3", "itime",
+    "header_protection_key", "content_padding_addition", "rekey_after_time",
+    "rekey_timeout", "reject_after_time", "keepalive_timeout", "max_handshake_attempts",
 )
+
+_AMNEZIA_NUMERIC_EDITOR_KEYS = {
+    "jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "itime",
+}
+_AMNEZIA_RANGE_EDITOR_KEYS = {
+    "content_padding_addition",
+    "rekey_after_time",
+    "rekey_timeout",
+    "reject_after_time",
+    "keepalive_timeout",
+    "max_handshake_attempts",
+}
 
 # AWG can talk to a standard WireGuard peer when the packet padding remains
 # disabled and H1-H4 retain WireGuard's original message identifiers.  Client-
@@ -532,7 +937,7 @@ def _amnezia_editor_fields(
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for key in _AMNEZIA_EDITOR_KEYS:
-        kind = "number" if key in {"jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "itime"} else "area" if key.startswith(("i", "j")) and key not in {"jmin", "jmax"} else "text"
+        kind = "number" if key in _AMNEZIA_NUMERIC_EDITOR_KEYS else "area" if key.startswith(("i", "j")) and key not in {"jmin", "jmax"} else "text"
         result.append(
             _editor_field(
                 f"awg_{key}",
@@ -1363,8 +1768,11 @@ def build_node_updates(node, fields: dict) -> dict:
                     raw_value = raw(f"awg_{key}", "")
                     if protocol == "wireguard" and raw_value in (None, ""):
                         raw_value = _WG_COMPATIBLE_AMNEZIA_DEFAULTS.get(key, "")
-                    if key in {"jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "itime"}:
+                    if key in _AMNEZIA_NUMERIC_EDITOR_KEYS:
                         parsed = _editor_int(raw_value, None)
+                    elif key in _AMNEZIA_RANGE_EDITOR_KEYS:
+                        text_value = str(raw_value or "").strip()
+                        parsed = int(text_value) if text_value.isascii() and text_value.isdigit() else text_value
                     else:
                         parsed = str(raw_value or "").strip()
                     _set_optional(amnezia, key, parsed)
@@ -1400,7 +1808,13 @@ def build_node_updates(node, fields: dict) -> dict:
             amnezia = native.setdefault("amnezia", {})
             for key in _AMNEZIA_EDITOR_KEYS:
                 raw_value = raw(f"awg_{key}", "")
-                parsed = _editor_int(raw_value, None) if key in {"jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "itime"} else str(raw_value or "").strip()
+                if key in _AMNEZIA_NUMERIC_EDITOR_KEYS:
+                    parsed = _editor_int(raw_value, None)
+                elif key in _AMNEZIA_RANGE_EDITOR_KEYS:
+                    text_value = str(raw_value or "").strip()
+                    parsed = int(text_value) if text_value.isascii() and text_value.isdigit() else text_value
+                else:
+                    parsed = str(raw_value or "").strip()
                 _set_optional(amnezia, key, parsed)
             if not amnezia:
                 native.pop("amnezia", None)

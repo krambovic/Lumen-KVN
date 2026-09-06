@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from PyQt6.QtCore import QCoreApplication
 
 from xray_fluent.app_controller import AppController
@@ -117,3 +119,15 @@ def test_updater_disconnect_is_acknowledged_on_shutdown() -> None:
         assert controller._pending_update_disconnects == []
     finally:
         _shutdown(controller)
+
+
+def test_unexpected_core_exit_is_ignored_once_windows_shutdown_started() -> None:
+    controller = SimpleNamespace(
+        _system_shutdown=True,
+        _shutting_down=False,
+        _cleaning_connection_state=False,
+    )
+
+    runtime_services.handle_unexpected_disconnect(controller)
+
+    assert controller._cleaning_connection_state is False

@@ -160,3 +160,15 @@ def test_release_build_bundles_naive_cronet_companion() -> None:
     assert "libcronet.dll" in build_script
     assert "naive-v1" in stable_workflow
     assert "naive-v1" in prerelease_workflow
+
+
+def test_singbox_build_defaults_to_the_awg31_compatible_outbound_release() -> None:
+    build_script = (ROOT / "scripts" / "build_singbox_extended.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'Ref = "v1.14.0-extended-2.7.1"' in build_script
+    assert "apply --unidiff-zero" in build_script
+    assert '"tunnel_address"' in (ROOT / "xray_fluent" / "link_parser.py").read_text(
+        encoding="utf-8"
+    )

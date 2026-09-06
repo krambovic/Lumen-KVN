@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 from copy import deepcopy
 import ipaddress
 import json
@@ -38,6 +39,38 @@ _AMNEZIA_RANGE_KEYS = ("h1", "h2", "h3", "h4")
 _AMNEZIA_STR_KEYS = ("i1", "i2", "i3", "i4", "i5", "j1", "j2", "j3")
 _AWG_BYTES_TAG_RE = re.compile(r"<b\s+0x([0-9A-Fa-f]*)>")
 _AWG_UINT_RANGE_RE = re.compile(r"\d+(?:\s*-\s*\d+)?")
+
+# AmneziaWG 3.0/3.1 fields.  sing-box-extended represents these values in the
+# endpoint's ``amnezia`` object using snake_case names.  Keeping the mapping
+# here (rather than in the runtime builder) makes .conf, URI and native JSON
+# imports follow the same validation path.
+_AMNEZIA_AWG3_CONF_NAMES = {
+    "contentpaddingaddition": "ContentPaddingAddition",
+    "rekeyaftertime": "RekeyAfterTime",
+    "rekeytimeout": "RekeyTimeout",
+    "rejectaftertime": "RejectAfterTime",
+    "keepalivetimeout": "KeepaliveTimeout",
+    "maxhandshakeattempts": "MaxHandshakeAttempts",
+}
+_AMNEZIA_AWG3_DASH_NAMES = {
+    "contentpaddingaddition": "content-padding-addition",
+    "rekeyaftertime": "rekey-after-time",
+    "rekeytimeout": "rekey-timeout",
+    "rejectaftertime": "reject-after-time",
+    "keepalivetimeout": "keepalive-timeout",
+    "maxhandshakeattempts": "max-handshake-attempts",
+}
+_AMNEZIA_AWG3_RANGE_KEYS = {
+    "contentpaddingaddition": "content_padding_addition",
+    "rekeyaftertime": "rekey_after_time",
+    "rekeytimeout": "rekey_timeout",
+    "rejectaftertime": "reject_after_time",
+    "keepalivetimeout": "keepalive_timeout",
+    "maxhandshakeattempts": "max_handshake_attempts",
+}
+_AMNEZIA_JSON_RANGE_KEYS = tuple(_AMNEZIA_AWG3_RANGE_KEYS.values())
+_AWG_UINT32_MAX = 0xFFFFFFFF
+_AWG_RANGE_RE = re.compile(r"^(\d+)-(\d+)$")
 
 
 def parse_links_text(
@@ -248,7 +281,12 @@ def _decode_b64(data: str) -> str:
         raw = base64.urlsafe_b64decode(data.encode("utf-8"))
     except Exception:
         raw = base64.b64decode(data.encode("utf-8"))
-    return raw.decode("utf-8")
+    for encoding in ("utf-8", "cp1251", "gb18030", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def _clean_name(name: str, fallback: str) -> str:
@@ -628,12 +666,18 @@ def _repair_legacy_direct_masque_shape(node: Node) -> bool:
     profile_private_key = str(profile.get("private_key") or "").strip()
     private_key = str(native.get("private_key") or profile_private_key).strip()
     public_key = str(native.get("public_key") or "").strip()
-    address = native.get("address")
+    changed = False
+    address = native.get("tunnel_address")
+    legacy_address = native.get("address")
+    if not address and isinstance(legacy_address, list):
+        address = legacy_address
+        native["tunnel_address"] = address
+        native.pop("address", None)
+        changed = True
     server = str(native.get("server") or node.server or "").strip()
     if not (private_key and public_key and address and server):
         return False
 
-    changed = False
     if native.get("private_key") != private_key:
         native["private_key"] = private_key
         changed = True
@@ -806,6 +850,32 @@ def _validate_amnezia_settings(node: Node, amnezia: dict[str, Any]) -> str | Non
         for match in _AWG_BYTES_TAG_RE.finditer(value):
             if len(match.group(1)) % 2:
                 return f"AWG: нечётное число hex-символов в {key.upper()}."
+    header_key = amnezia.get("header_protection_key")
+    if header_key is not None:
+        try:
+            _validate_awg3_header_key(str(header_key))
+        except LinkParseError as exc:
+            return f"Сервер {node_label}: {exc}"
+        for key in ("s1", "s2", "s3", "s4"):
+            value = amnezia.get(key)
+            if type(value) is not int or value < 12:
+                return (
+                    f"Сервер {node_label}: AWG 3.0 с HeaderProtectionKey требует "
+                    f"{key.upper()} не меньше 12."
+                )
+    for key in _AMNEZIA_JSON_RANGE_KEYS:
+        value = amnezia.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            return (
+                f"Сервер {node_label}: параметр AWG `{key}` должен быть числом "
+                "или диапазоном A-B."
+            )
+        try:
+            _validate_awg3_range(str(value), key)
+        except LinkParseError as exc:
+            return f"Сервер {node_label}: {exc}"
     jmin = amnezia.get("jmin")
     jmax = amnezia.get("jmax")
     if type(jmin) is int and type(jmax) is int and jmin > jmax:
@@ -1671,7 +1741,7 @@ def _parse_clash_masque_payload(
                 "server_port": int(port or 443),
                 "private_key": private_key,
                 "public_key": public_key,
-                "address": address,
+                "tunnel_address": address,
                 "mtu": int(payload.get("mtu") or 1280),
             }
         )
@@ -2522,6 +2592,18 @@ def _parse_hysteria(link: str) -> Node:
         outbound["up_mbps"] = int(up_mbps)
     if down_mbps:
         outbound["down_mbps"] = int(down_mbps)
+    server_ports = _get_param(params, "server_ports", "server-ports", "ports")
+    if server_ports:
+        outbound["server_ports"] = [item.strip() for item in server_ports.split(",") if item.strip()]
+    hop_interval = _get_param(params, "hop_interval", "hop-interval")
+    if hop_interval:
+        outbound["hop_interval"] = hop_interval
+    for key in ("recv_window_conn", "recv-window-conn", "recv_window", "recv-window"):
+        value = _get_param(params, key)
+        if value:
+            outbound[key.replace("-", "_")] = int(value)
+    if _to_bool(_get_param(params, "disable_mtu_discovery", "disable-mtu-discovery")):
+        outbound["disable_mtu_discovery"] = True
     _apply_hysteria_tls(outbound, params, server)
     _apply_hysteria_obfs(outbound, params)
     name = _clean_name(parsed.fragment, f"hysteria-{server}:{port}")
@@ -2545,6 +2627,24 @@ def _parse_hysteria2(link: str) -> Node:
         "server_port": int(port),
         "password": password,
     }
+    server_ports = _get_param(params, "server_ports", "server-ports", "ports")
+    if server_ports:
+        outbound["server_ports"] = [item.strip() for item in server_ports.split(",") if item.strip()]
+    hop_interval = _get_param(params, "hop_interval", "hop-interval")
+    if hop_interval:
+        outbound["hop_interval"] = hop_interval
+    up_mbps = _get_param(params, "upmbps", "up_mbps", "up")
+    down_mbps = _get_param(params, "downmbps", "down_mbps", "down")
+    if up_mbps:
+        outbound["up_mbps"] = int(up_mbps)
+    if down_mbps:
+        outbound["down_mbps"] = int(down_mbps)
+    for key in ("recv_window_conn", "recv-window-conn", "recv_window", "recv-window"):
+        value = _get_param(params, key)
+        if value:
+            outbound[key.replace("-", "_")] = int(value)
+    if _to_bool(_get_param(params, "disable_mtu_discovery", "disable-mtu-discovery")):
+        outbound["disable_mtu_discovery"] = True
     _apply_hysteria_tls(outbound, params, server)
     _apply_hysteria_obfs(outbound, params)
     name = _clean_name(parsed.fragment, f"hysteria2-{server}:{port}")
@@ -2766,8 +2866,12 @@ def _parse_wireguard_like_link(link: str, scheme: str) -> Node:
 
     if scheme == "warp":
         endpoint = _build_warp_endpoint(params)
+        dns_servers = _split_csv(_get_param(params, "dns", "dns_servers"))
+        outbound = _native_singbox_outbound(endpoint)
+        if dns_servers:
+            outbound["_dns"] = dns_servers
         name = _clean_name(parsed.fragment, "AWG/WARP" if endpoint.get("amnezia") else "WARP")
-        return Node(name=name, scheme="warp", server="engage.cloudflareclient.com", port=2408, link=link, outbound=_native_singbox_outbound(endpoint), tags=["WARP"])
+        return Node(name=name, scheme="warp", server="engage.cloudflareclient.com", port=2408, link=link, outbound=outbound, tags=["WARP"])
 
     server = parsed.hostname or _get_param(params, "server", "endpoint", "address")
     port = parsed.port or int(_get_param(params, "port", default="0") or 0) or 51820
@@ -2849,13 +2953,17 @@ def _parse_wireguard_like_link(link: str, scheme: str) -> Node:
                 "disablePauses",
             ),
         )
+    dns_servers = _split_csv(_get_param(params, "dns", "dns_servers"))
+    outbound = _native_singbox_outbound(endpoint)
+    if dns_servers:
+        outbound["_dns"] = dns_servers
     name = _clean_name(
         parsed.fragment,
         _wireguard_display_name(server, port, bool(endpoint.get("amnezia")), scheme),
     )
     tags = ["WARP"] if _is_warp_endpoint(server) else []
     display_scheme = "awg" if amnezia else ("warp" if endpoint.get("type") == "warp" else scheme)
-    return Node(name=name, scheme=display_scheme, server=server, port=port, link=link, outbound=_native_singbox_outbound(endpoint), tags=tags)
+    return Node(name=name, scheme=display_scheme, server=server, port=port, link=link, outbound=outbound, tags=tags)
 
 
 def _parse_wireguard_config(text: str) -> Node:
@@ -3173,6 +3281,43 @@ def _parse_reserved_bytes(value: Any) -> list[int]:
     return result
 
 
+def _validate_awg3_header_key(value: str) -> str:
+    """Validate HeaderProtectionKey as a base64 encoded 32-byte key."""
+    text = str(value or "").strip()
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise LinkParseError(
+            f"некорректный HeaderProtectionKey: ожидается base64 ключ длиной 32 байта"
+        ) from exc
+    if len(raw) != 32:
+        raise LinkParseError(
+            f"некорректный HeaderProtectionKey: {len(raw)} байт вместо 32"
+        )
+    return text
+
+
+def _validate_awg3_range(value: str, field: str) -> int | str:
+    """Validate an AWG 3.0 uint32 value or an inclusive ``A-B`` range."""
+    text = str(value or "").strip()
+    # Restrict to ASCII digits: ``str.isdigit`` accepts Unicode superscripts
+    # which ``int`` cannot parse consistently across Python versions.
+    if re.fullmatch(r"[0-9]+", text):
+        number = int(text)
+        if number > _AWG_UINT32_MAX:
+            raise LinkParseError(f"слишком большое значение в поле {field}: {value}")
+        return number
+    match = _AWG_RANGE_RE.fullmatch(text)
+    if match is None:
+        raise LinkParseError(
+            f"некорректный диапазон в поле {field}: {value} (ожидается число или A-B)"
+        )
+    low, high = int(match.group(1)), int(match.group(2))
+    if high > _AWG_UINT32_MAX or low > high:
+        raise LinkParseError(f"некорректный диапазон в поле {field}: {value}")
+    return f"{low}-{high}"
+
+
 def _is_xray_auto_config_payload(payload: Any) -> bool:
     """Recognize full Xray configs whose balancer must not be split into nodes."""
     if not isinstance(payload, dict):
@@ -3219,6 +3364,29 @@ def _amnezia_from_params(params: dict[str, str]) -> dict[str, Any]:
         value = _get_param(params, key, key.upper())
         if value:
             result[key] = value
+    header_key = _get_param(
+        params,
+        "header_protection_key",
+        "header-protection-key",
+        "headerprotectionkey",
+        "headerProtectionKey",
+        "HeaderProtectionKey",
+    )
+    if header_key:
+        result["header_protection_key"] = _validate_awg3_header_key(header_key)
+    for source_key, json_key in _AMNEZIA_AWG3_RANGE_KEYS.items():
+        value = _get_param(
+            params,
+            source_key,
+            source_key.replace("_", ""),
+            _AMNEZIA_AWG3_DASH_NAMES[source_key],
+            _AMNEZIA_AWG3_CONF_NAMES[source_key],
+            json_key,
+        )
+        if value:
+            result[json_key] = _validate_awg3_range(
+                value, _AMNEZIA_AWG3_CONF_NAMES[source_key]
+            )
     return result
 
 

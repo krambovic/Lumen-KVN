@@ -316,6 +316,12 @@ data class SettingsUiState(
     val pingGoodMs: Int = 150,
     val pingFairMs: Int = 300,
     val pingAutoOnOpen: Boolean = false,
+    /** Remove completed ping results at or below [pingAutoDeleteThresholdMs]. */
+    val pingAutoDeleteUnreachable: Boolean = false,
+    /** Defaults to the requested 0/1 ms cleanup, but 0 keeps a valid 1 ms result. */
+    val pingAutoDeleteThresholdMs: Int = 1,
+    /** Check GitHub for a newer Android APK when the app is opened, at most daily. */
+    val autoCheckUpdates: Boolean = true,
     val dashboardStyle: DashboardStyle = DashboardStyle.DEFAULT,
     val launcherIcon: LauncherIconOption = LauncherIconOption.SYSTEM
 )

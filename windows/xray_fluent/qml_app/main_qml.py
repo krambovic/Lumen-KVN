@@ -850,6 +850,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from ..constants import APP_ICON_PATH, APP_NAME
     from .bridge import AppBridge
+    from ..power_reconnect import WindowsPowerEventFilter
 
     QApplication.setApplicationName(APP_NAME)
 
@@ -879,6 +880,10 @@ def main(argv: list[str] | None = None) -> int:
     bridge = AppBridge()
     bridge._single_instance_server = single_server
     bridge.load()
+    power_event_filter = None
+    if sys.platform == "win32":
+        power_event_filter = WindowsPowerEventFilter(bridge.controller, app)
+        app.installNativeEventFilter(power_event_filter)
 
     qmlRegisterSingletonInstance("App", 1, 0, "App", bridge)
 
@@ -1027,6 +1032,11 @@ def main(argv: list[str] | None = None) -> int:
         app.commitDataRequest.connect(lambda _manager: bridge.prepareSystemShutdown())
     except Exception:
         pass
+    if power_event_filter is not None:
+        app.aboutToQuit.connect(power_event_filter.close)
+        app.aboutToQuit.connect(
+            lambda: app.removeNativeEventFilter(power_event_filter)
+        )
     app.aboutToQuit.connect(bridge.shutdown)
 
     return app.exec()

@@ -9,7 +9,10 @@ import threading
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from .application.node_service import SubscriptionFetchCancelled, fetch_subscription_payload
+from .application.node_service import (
+    SubscriptionFetchCancelled,
+    fetch_subscription_payload_result,
+)
 from .http_utils import abort_http_response
 
 
@@ -26,13 +29,15 @@ class SubscriptionJob:
     use_proxy_tun: bool = False
     proxy_url: str = ""
     converter_url: str = ""
+    etag: str = ""
+    last_modified: str = ""
 
 
 class SubscriptionFetchWorker(QObject):
     """Грузит подписки по сети в фоновом потоке."""
 
-    # batch_id, job, text, userinfo, errors
-    fetched = pyqtSignal(int, object, str, object, object)
+    # batch_id, job, text, userinfo, errors, response metadata
+    fetched = pyqtSignal(int, object, str, object, object, object)
     # batch_id, total
     completed = pyqtSignal(int, int)
 
@@ -63,7 +68,7 @@ class SubscriptionFetchWorker(QObject):
             if self._stopped.is_set():
                 return
             try:
-                text, userinfo, errors = fetch_subscription_payload(
+                result = fetch_subscription_payload_result(
                     job.url,
                     user_agent=job.user_agent,
                     hwid=job.hwid,
@@ -71,17 +76,26 @@ class SubscriptionFetchWorker(QObject):
                     use_proxy_tun=job.use_proxy_tun,
                     proxy_url=job.proxy_url,
                     converter_url=job.converter_url,
+                    cache_etag=job.etag,
+                    cache_last_modified=job.last_modified,
                     cancelled=self._stopped.is_set,
                     response_opened=self._register_response,
                     response_closed=self._unregister_response,
                 )
+                text, userinfo, errors = result.text, result.userinfo, result.errors
+                metadata = {
+                    "headers": dict(result.headers),
+                    "status": result.status,
+                    "not_modified": result.not_modified,
+                }
             except SubscriptionFetchCancelled:
                 return
             except Exception as exc:  # никогда не роняем рабочий поток
                 text, userinfo, errors = "", {}, [str(exc)]
+                metadata = {"headers": {}, "status": 0, "not_modified": False}
             if self._stopped.is_set():
                 return
-            self.fetched.emit(batch_id, job, text, userinfo, list(errors))
+            self.fetched.emit(batch_id, job, text, userinfo, list(errors), metadata)
             total += 1
         if not self._stopped.is_set():
             self.completed.emit(batch_id, total)

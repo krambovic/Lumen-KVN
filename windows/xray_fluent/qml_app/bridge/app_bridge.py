@@ -13,6 +13,7 @@ Design goals:
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timezone
 import json
 import logging
 import re
@@ -33,6 +34,7 @@ from ...constants import (
     DEFAULT_HTTP_PORT,
     DEFAULT_SOCKS_PORT,
     SPEED_TEST_MAX_CONCURRENCY,
+    SUBSCRIPTION_PARSER_REVISION,
 )
 from ...country_flags import detect_country, get_flag_emoji, get_flag_svg_data_uri
 from ...deeplinks import DeepLinkError, parse_lumen_deep_link
@@ -442,11 +444,23 @@ class AppBridge(QObject):
             subs = self.controller.state.subscriptions
             if not subs:
                 return
-            jobs = [
-                SubscriptionJob(url=(s.get("url") or "").strip(), kind="update")
-                for s in subs
-                if (s.get("url") or "").strip()
-            ]
+            now = datetime.now(timezone.utc)
+            jobs = []
+            for subscription in subs:
+                url = str(subscription.get("url") or "").strip()
+                if not url:
+                    continue
+                try:
+                    backoff = datetime.fromisoformat(
+                        str(subscription.get("backoff_until") or "")
+                    )
+                    if backoff.tzinfo is None:
+                        backoff = backoff.replace(tzinfo=timezone.utc)
+                    if backoff > now:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                jobs.append(SubscriptionJob(url=url, kind="update"))
             self._dispatch_sub_jobs(jobs, "auto")
         except Exception:
             pass
@@ -523,13 +537,42 @@ class AppBridge(QObject):
             job.use_proxy_tun = use_proxy_tun
             job.proxy_url = proxy_url
             job.converter_url = converter_url
+            job.etag = ""
+            job.last_modified = ""
+            existing = next(
+                (
+                    item
+                    for item in getattr(self.controller.state, "subscriptions", [])
+                    if str(item.get("url") or "").strip() == str(job.url or "").strip()
+                ),
+                None,
+            )
+            if isinstance(existing, dict):
+                try:
+                    cache_allowed = (
+                        int(existing.get("parser_revision") or 0)
+                        == SUBSCRIPTION_PARSER_REVISION
+                    )
+                except (TypeError, ValueError):
+                    cache_allowed = False
+                if cache_allowed:
+                    job.etag = str(existing.get("etag") or "")
+                    job.last_modified = str(existing.get("last_modified") or "")
         self._sub_batch_seq += 1
         batch_id = self._sub_batch_seq
         self._sub_batches[batch_id] = {"kind": kind, "added": 0, "errors": []}
         self._ensure_sub_worker()
         self._sub_fetch_run.emit(list(jobs), batch_id)
 
-    def _on_sub_fetched(self, batch_id: int, job: object, text: str, userinfo: object, errors: object) -> None:
+    def _on_sub_fetched(
+        self,
+        batch_id: int,
+        job: object,
+        text: str,
+        userinfo: object,
+        errors: object,
+        metadata: object = None,
+    ) -> None:
         """Применяет результат одной подписки. Всегда GUI-поток (queued)."""
         batch = self._sub_batches.get(batch_id)
         if batch is None:
@@ -540,7 +583,13 @@ class AppBridge(QObject):
         }
         try:
             added, errs = self.controller.apply_fetched_subscription(
-                job.url, job.name, job.kind, text, userinfo, list(errors or [])
+                job.url,
+                job.name,
+                job.kind,
+                text,
+                userinfo,
+                list(errors or []),
+                dict(metadata or {}),
             )
         except Exception as exc:  # noqa: BLE001
             added, errs = 0, [str(exc)]
@@ -1825,6 +1874,12 @@ class AppBridge(QObject):
         settings.reconnect_on_network_change = bool(enabled)
         self.controller.update_settings(settings)
 
+    @pyqtSlot(bool)
+    def setReconnectAfterSleep(self, enabled: bool) -> None:
+        settings = deepcopy(self.controller.state.settings)
+        settings.reconnect_after_sleep = bool(enabled)
+        self.controller.update_settings(settings)
+
     @pyqtSlot(str)
     def setRegionalPreset(self, value: str) -> None:
         from ...routing_presets import normalize_regional_preset
@@ -2342,7 +2397,9 @@ class AppBridge(QObject):
             self.controller._get_node_by_id(node_id) if node_id
             else self.controller.selected_node
         )
-        link = (getattr(node, "link", "") or "").strip() if node is not None else ""
+        from .node_edit_helpers import normalized_node_export_link
+
+        link = normalized_node_export_link(node)
         if not link:
             self.toast.emit("warning", "У сервера нет ссылки для копирования")
             return
@@ -2380,8 +2437,10 @@ class AppBridge(QObject):
             self.toast.emit("warning", tr("Нельзя экспортировать вместе конфиги разных архитектур (например AWG и VLESS)"))
             return
         links: list[str] = []
+        from .node_edit_helpers import normalized_node_export_link
+
         for node in selected:
-            link = (getattr(node, "link", "") or "").strip()
+            link = normalized_node_export_link(node)
             if link:
                 links.append(link)
         if not links:
@@ -2399,7 +2458,9 @@ class AppBridge(QObject):
             self.controller._get_node_by_id(node_id) if node_id
             else self.controller.selected_node
         )
-        link = (getattr(node, "link", "") or "").strip() if node is not None else ""
+        from .node_edit_helpers import normalized_node_export_link
+
+        link = normalized_node_export_link(node)
         if not link:
             self.toast.emit("warning", tr("У сервера нет ссылки для QR-кода"))
             return
@@ -3158,6 +3219,12 @@ class AppBridge(QObject):
     @pyqtSlot()
     def importClipboard(self) -> None:
         clipboard = QGuiApplication.clipboard()
+        mime_data = clipboard.mimeData() if clipboard is not None else None
+        if mime_data is not None and mime_data.hasUrls():
+            clipboard_urls = list(mime_data.urls())
+            if any(self._dropped_config_path(value) is not None for value in clipboard_urls):
+                self.importNodeFiles(clipboard_urls)
+                return
         text = clipboard.text().strip() if clipboard is not None else ""
         if not text:
             self.toast.emit("warning", "Буфер обмена пуст")
@@ -3691,6 +3758,13 @@ class AppBridge(QObject):
     def reconnectOnNetworkChange(self) -> bool:
         try:
             return bool(self.controller.state.settings.reconnect_on_network_change)
+        except Exception:
+            return True
+
+    @pyqtProperty(bool, notify=settingsChanged)
+    def reconnectAfterSleep(self) -> bool:
+        try:
+            return bool(self.controller.state.settings.reconnect_after_sleep)
         except Exception:
             return True
 

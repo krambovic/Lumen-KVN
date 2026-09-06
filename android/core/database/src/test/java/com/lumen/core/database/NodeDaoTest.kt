@@ -90,6 +90,36 @@ class NodeDaoTest {
     }
 
     @Test
+    fun getNodesByIdsReturnsOnlyRequestedRows() = runBlocking {
+        nodeDao.insertNodes(
+            listOf(
+                NodeEntity(
+                    id = "node-query-1",
+                    name = "First",
+                    protocol = "vless",
+                    server = "first.example",
+                    port = 443,
+                    link = "vless://first",
+                    pingMs = 0
+                ),
+                NodeEntity(
+                    id = "node-query-2",
+                    name = "Second",
+                    protocol = "vless",
+                    server = "second.example",
+                    port = 443,
+                    link = "vless://second",
+                    pingMs = 20
+                )
+            )
+        )
+
+        val selected = nodeDao.getNodesByIds(listOf("node-query-1"))
+
+        assertEquals(listOf("node-query-1"), selected.map { it.id })
+    }
+
+    @Test
     fun testDeleteNode() = runBlocking {
         val node = NodeEntity(
             id = "node-3",

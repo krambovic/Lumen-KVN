@@ -30,6 +30,8 @@ class ActiveSessionSnapshot:
     protect_ss_password: str
     ping_host: str
     ping_port: int
+    clash_api_selector: str = ""
+    clash_api_node_signatures: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(slots=True)
@@ -71,6 +73,8 @@ def build_active_session_snapshot(
     protect_ss_password: str,
     ping_host: str,
     ping_port: int,
+    clash_api_selector: str = "",
+    clash_api_node_signatures: tuple[tuple[str, str], ...] = (),
 ) -> ActiveSessionSnapshot:
     return ActiveSessionSnapshot(
         node_id=node_id,
@@ -96,4 +100,6 @@ def build_active_session_snapshot(
         protect_ss_password=protect_ss_password,
         ping_host=ping_host,
         ping_port=ping_port,
+        clash_api_selector=clash_api_selector,
+        clash_api_node_signatures=tuple(clash_api_node_signatures),
     )

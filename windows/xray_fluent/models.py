@@ -84,6 +84,10 @@ class Node:
     sort_order: int = 0
     subscription_id: str = ""
     description: str = ""
+    # Stable identity of a subscription entry.  Unlike the provider display
+    # name or list position this survives harmless formatting/name changes and
+    # lets reconcile preserve ping/speed history and local ordering.
+    source_key: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -107,6 +111,7 @@ class Node:
             "sort_order": self.sort_order,
             "subscription_id": self.subscription_id,
             "description": self.description,
+            "source_key": self.source_key,
         }
 
     @staticmethod
@@ -132,6 +137,7 @@ class Node:
             sort_order=int(data.get("sort_order", 0)),
             subscription_id=str(data.get("subscription_id") or ""),
             description=str(data.get("description") or ""),
+            source_key=str(data.get("source_key") or ""),
         )
 
 
@@ -233,6 +239,12 @@ class RoutingSettings:
                 preset_id = "global"
             else:
                 preset_id = "custom"
+        mode = str(data.get("mode") or ROUTING_RULE)
+        if mode.strip().lower() == "global" and preset_id in {"blocked", "blocked_cn"}:
+            # Older persisted states could infer the blocked-only preset from
+            # its domain rules while retaining the old global mode.  That
+            # combination makes native sing-box proxy runtime full-tunnel.
+            mode = ROUTING_RULE
         raw_bootstrap_servers = data.get("dns_bootstrap_servers")
         if raw_bootstrap_servers is None:
             bootstrap_server = str(data.get("dns_bootstrap_server") or "1.1.1.1")
@@ -245,7 +257,7 @@ class RoutingSettings:
             ]
             bootstrap_server = bootstrap_servers[0] if bootstrap_servers else ""
         return RoutingSettings(
-            mode=str(data.get("mode") or ROUTING_RULE),
+            mode=mode,
             preset_id=preset_id,
             bypass_lan=bool(data.get("bypass_lan", True)),
             direct_domains=list(data.get("direct_domains") or []),
@@ -320,6 +332,7 @@ class AppSettings:
     # Block connecting when another VPN/proxy client is detected.
     block_vpn_conflicts: bool = True
     reconnect_on_network_change: bool = True
+    reconnect_after_sleep: bool = True
     regional_preset: str = "russia"  # russia | china | iran
     prefer_ipv6: bool = False
     # Kill-switch: при неожиданном обрыве VPN не выпускать трафик напрямую (fail-closed).
@@ -440,6 +453,7 @@ class AppSettings:
             "always_run_as_admin": self.always_run_as_admin,
             "block_vpn_conflicts": self.block_vpn_conflicts,
             "reconnect_on_network_change": self.reconnect_on_network_change,
+            "reconnect_after_sleep": self.reconnect_after_sleep,
             "regional_preset": self.regional_preset,
             "prefer_ipv6": self.prefer_ipv6,
             "kill_switch": self.kill_switch,
@@ -545,6 +559,7 @@ class AppSettings:
             always_run_as_admin=bool(data.get("always_run_as_admin", False)),
             block_vpn_conflicts=bool(data.get("block_vpn_conflicts", True)),
             reconnect_on_network_change=bool(data.get("reconnect_on_network_change", True)),
+            reconnect_after_sleep=bool(data.get("reconnect_after_sleep", True)),
             regional_preset=str(data.get("regional_preset") or "russia"),
             prefer_ipv6=bool(data.get("prefer_ipv6", False)),
             kill_switch=bool(data.get("kill_switch", False)),

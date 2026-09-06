@@ -128,7 +128,7 @@ rules:
     assert nodes[0].outbound["singbox"]["server_port"] == 443
     assert nodes[0].outbound["singbox"]["private_key"] == "private"
     assert nodes[0].outbound["singbox"]["public_key"] == "public"
-    assert nodes[0].outbound["singbox"]["address"] == [
+    assert nodes[0].outbound["singbox"]["tunnel_address"] == [
         "172.16.0.2/32",
         "2606:4700:110::1/128",
     ]
@@ -164,7 +164,7 @@ def test_legacy_clash_masque_node_restores_direct_profile_before_runtime() -> No
     assert node.outbound["singbox"]["profile"] == {"detour": "direct"}
     assert node.outbound["singbox"]["private_key"] == "wireguard-private-key"
     assert node.outbound["singbox"]["public_key"] == "wireguard-public-key"
-    assert node.outbound["singbox"]["address"] == ["172.16.0.2/32"]
+    assert node.outbound["singbox"]["tunnel_address"] == ["172.16.0.2/32"]
     assert node.outbound["_dns"] == ["1.1.1.1", "1.0.0.1"]
 
 

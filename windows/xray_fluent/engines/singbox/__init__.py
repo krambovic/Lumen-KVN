@@ -2,7 +2,7 @@
 
 from .config_builder import build_singbox_outbound
 from .manager import SingBoxManager, get_singbox_version
-from .operations import restart_runtime, start_proxy, start_runtime, start_tun
+from .operations import restart_runtime, start_proxy, start_runtime, start_tun, try_hot_switch_selector
 from .runtime_planner import (
     ParsedSingboxDocument,
     SingboxDocumentState,
@@ -13,6 +13,8 @@ from .runtime_planner import (
     parse_singbox_document,
     plan_singbox_runtime,
     prime_endpoint_resolution,
+    singbox_node_tag,
+    singbox_node_source_signature,
 )
 
 __all__ = [
@@ -23,6 +25,7 @@ __all__ = [
     "start_tun",
     "start_proxy",
     "start_runtime",
+    "try_hot_switch_selector",
     "ParsedSingboxDocument",
     "SingboxDocumentState",
     "SingboxRuntimePlan",
@@ -32,4 +35,6 @@ __all__ = [
     "parse_singbox_document",
     "plan_singbox_runtime",
     "prime_endpoint_resolution",
+    "singbox_node_tag",
+    "singbox_node_source_signature",
 ]

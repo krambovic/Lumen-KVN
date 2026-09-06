@@ -38,6 +38,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
@@ -92,6 +93,7 @@ import com.lumen.core.vpn.LumenVpnService
 import com.lumen.app.vm.MainViewModel
 import com.lumen.ui.components.LumenDialog
 import com.lumen.ui.screens.DashboardScreen
+import com.lumen.ui.screens.AndroidUpdateNotice
 import com.lumen.ui.screens.DomainRoutingScreen
 import com.lumen.ui.screens.GeoResourcesScreen
 import com.lumen.ui.screens.ImportPhaseUi
@@ -216,6 +218,7 @@ fun LumenApp(
     }
 
     var settingsResetSignal by remember { mutableIntStateOf(0) }
+    var dismissedUpdateTag by rememberSaveable { mutableStateOf<String?>(null) }
 
     val mainTabRoutes = remember { listOf("dashboard", "servers", "settings") }
     val activity = context as? android.app.Activity
@@ -453,14 +456,25 @@ fun LumenApp(
 
             val navBackStackEntry by navController.currentBackStackEntryAsState()
             val currentNavRoute = navBackStackEntry?.destination?.route
-            NavHost(
-                navController = navController,
-                startDestination = "dashboard",
-                // Every tab reserves room for the bar so nothing scrolls underneath it.
-                modifier = Modifier.padding(
+            Column(Modifier.fillMaxSize()) {
+                val updateTag = updateState.latest?.tag
+                if (updateState.updateAvailable && updateTag != null && updateTag != dismissedUpdateTag) {
+                    AndroidUpdateNotice(
+                        version = updateState.latest?.version?.let { "v$it" },
+                        isDownloading = updateState.isDownloading,
+                        progress = updateState.downloadProgress,
+                        onDownload = ::requestAndroidUpdate,
+                        onDismiss = { dismissedUpdateTag = updateTag }
+                    )
+                }
+                NavHost(
+                    navController = navController,
+                    startDestination = "dashboard",
+                    // Every tab reserves room for the bar so nothing scrolls underneath it.
+                    modifier = Modifier.weight(1f).padding(
                     top = padding.calculateTopPadding(),
                     bottom = padding.calculateBottomPadding()
-                ),
+                    ),
                 enterTransition = {
                     val dir = if (isTabForward(initialState.destination.route, targetState.destination.route)) 1 else -1
                     slideInHorizontally(tween(320, easing = PremiumEasing)) { dir * it / 6 } +
@@ -721,6 +735,7 @@ fun LumenApp(
                         onExportText = { viewModel.exportLogText(context, it) }
                     )
                 }
+            }
             }
         }
 

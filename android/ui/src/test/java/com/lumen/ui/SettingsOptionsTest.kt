@@ -55,6 +55,9 @@ class SettingsOptionsTest {
         assertTrue(state.urlTestInterruptExistConnections)
         assertTrue(state.loggingEnabled)
         assertFalse(state.proxyOnly)
+        assertFalse(state.pingAutoDeleteUnreachable)
+        assertEquals(1, state.pingAutoDeleteThresholdMs)
+        assertTrue(state.autoCheckUpdates)
     }
 
     private val newLabels = listOf(
@@ -64,7 +67,9 @@ class SettingsOptionsTest {
         "tcpMultiPathDesc", "udpFragmentLabel", "udpFragmentDesc", "udpOverTcpLabel",
         "udpOverTcpDesc", "connectTimeoutLabel", "urlTestIdleTimeoutLabel",
         "urlTestInterrupt", "urlTestInterruptDesc", "loggingEnabled", "loggingEnabledDesc",
-        "proxyOnly", "proxyOnlyDesc"
+        "proxyOnly", "proxyOnlyDesc", "autoCheckUpdates", "autoCheckUpdatesDesc",
+        "pingAutoDeleteUnreachable", "pingAutoDeleteUnreachableDesc",
+        "pingAutoDeleteThresholdLabel"
     )
 
     @Test

@@ -191,6 +191,8 @@ fun SettingsScreen(
                     }
                     LumenScreenHeader(title = s.updates, onBack = { page = SettingsPage.HUB }, applyStatusBarPadding = false)
                     UpdateSettings(
+                        state = state,
+                        onUpdate = onUpdate,
                         checked = updateChecked,
                         isChecking = updateIsChecking,
                         latestVersion = updateLatestVersion,
@@ -270,6 +272,8 @@ private fun SettingsHub(
 
 @Composable
 private fun UpdateSettings(
+    state: SettingsUiState,
+    onUpdate: (SettingsUiState) -> Unit,
     checked: Boolean,
     isChecking: Boolean,
     latestVersion: String?,
@@ -293,6 +297,16 @@ private fun UpdateSettings(
             SettingsDivider()
             InfoRow(s.androidReleaseTag, releaseTag)
         }
+    }
+    Spacer(Modifier.height(12.dp))
+    SettingsCard {
+        Spacer(Modifier.height(4.dp))
+        ToggleRow(
+            s.autoCheckUpdates,
+            s.autoCheckUpdatesDesc,
+            state.autoCheckUpdates
+        ) { onUpdate(state.copy(autoCheckUpdates = it)) }
+        Spacer(Modifier.height(4.dp))
     }
     Spacer(Modifier.height(12.dp))
     val status = when {
@@ -844,6 +858,20 @@ private fun PingSettings(
         ToggleRow(s.pingAutoOnOpen, s.pingAutoOnOpenDesc, state.pingAutoOnOpen) {
             onUpdate(state.copy(pingAutoOnOpen = it))
         }
+        SettingsDivider()
+        ToggleRow(
+            s.pingAutoDeleteUnreachable,
+            s.pingAutoDeleteUnreachableDesc,
+            state.pingAutoDeleteUnreachable
+        ) { onUpdate(state.copy(pingAutoDeleteUnreachable = it)) }
+        if (state.pingAutoDeleteUnreachable) {
+            NumberField(
+                s.pingAutoDeleteThresholdLabel,
+                state.pingAutoDeleteThresholdMs
+            ) {
+                onUpdate(state.copy(pingAutoDeleteThresholdMs = it.coerceIn(0, 100)))
+            }
+        }
         Spacer(Modifier.height(4.dp))
         OutlinedButton(
             onClick = {
@@ -858,7 +886,9 @@ private fun PingSettings(
                         pingRetryDelayMs = 200,
                         pingGoodMs = 150,
                         pingFairMs = 300,
-                        pingAutoOnOpen = false
+                        pingAutoOnOpen = false,
+                        pingAutoDeleteUnreachable = false,
+                        pingAutoDeleteThresholdMs = 1
                     )
                 )
             },

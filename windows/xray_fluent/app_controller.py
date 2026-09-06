@@ -140,6 +140,7 @@ from .engines.singbox import (
     restart_runtime as restart_singbox_runtime_operation,
     SingboxDocumentState,
     SingboxRuntimePlan,
+    try_hot_switch_selector as try_singbox_hot_switch_selector_operation,
 )
 from .routing_runtime import routing_with_ip_preference
 from .constants import (
@@ -380,6 +381,7 @@ class AppController(QObject):
         self._pending_update_disconnects: list[QThread] = []
         self._xray_update_apply_requested = False
         self._reconnecting = False
+        self._resume_reconnect_pending = False
         self._connecting = False
         self._disconnecting = False
         self._cleaning_connection_state = False
@@ -1160,6 +1162,8 @@ class AppController(QObject):
             preferred_protect_password=preferred_protect_password,
             system_dns_servers=system_dns_servers,
             tun_mode=tun_mode,
+            enable_hot_switch=bool(tun_mode),
+            hot_switch_nodes=tuple(self.state.nodes),
         )
 
     def _start_singbox_runtime_plan(self, plan: SingboxRuntimePlan) -> bool:
@@ -1248,6 +1252,8 @@ class AppController(QObject):
         core: str,
         api_port: int,
         clash_api_secret: str = "",
+        clash_api_selector: str = "",
+        clash_api_node_signatures: tuple[tuple[str, str], ...] = (),
         hybrid: bool = False,
         socks_port: int | None = None,
         http_port: int | None = None,
@@ -1295,6 +1301,8 @@ class AppController(QObject):
             protect_ss_password=str(protect_ss_password),
             ping_host=str(ping_host),
             ping_port=int(ping_port),
+            clash_api_selector=str(clash_api_selector),
+            clash_api_node_signatures=tuple(clash_api_node_signatures),
         )
         self._blocked_transition_signature = ""
 
@@ -1385,6 +1393,8 @@ class AppController(QObject):
     def _can_tun_hot_swap(self, session: ActiveSessionSnapshot) -> bool:
         settings = self.state.settings
         node = self.selected_node
+        if node is None or session.node_id == node.id:
+            return False
         return can_tun_hot_swap_rule(
             session=session,
             settings_tun_mode=bool(settings.tun_mode),
@@ -1393,6 +1403,12 @@ class AppController(QObject):
         )
 
     def _compute_transition_action(self) -> str | None:
+        if self._resume_reconnect_pending:
+            if not self._desired_connected or self.locked:
+                return None
+            if self.connected:
+                return "reconnect"
+            return "connect"
         node = self.selected_node
         session = self._active_session
         context = TransitionContext(
@@ -1467,6 +1483,7 @@ class AppController(QObject):
 
         action = self._compute_transition_action()
         if action is None:
+            self._resume_reconnect_pending = False
             self._auto_switch_transitioning = False
             self._emit_no_transition_feedback()
             self._transition_pending = False
@@ -1475,6 +1492,7 @@ class AppController(QObject):
             return
 
         self._transition_pending = False
+        self._resume_reconnect_pending = False
         reason = self._transition_reason or action
         self._transition_active = True
         self.transition_state_changed.emit(True, self._transition_status_text(action))
@@ -1483,6 +1501,9 @@ class AppController(QObject):
 
     def _execute_transition_action(self, action: str, reason: str, generation: int) -> None:
         if not self._transition_active:
+            return
+        if reason == "system resume" and not self._desired_connected:
+            self._transition_completed.emit(True, action, reason, generation)
             return
 
         def _run() -> None:
@@ -1599,6 +1620,7 @@ class AppController(QObject):
         self._transition_pending = False
         self._transition_scheduled = False
         self._desired_connected = False
+        self._resume_reconnect_pending = False
         for worker in self._pending_update_disconnects:
             self._confirm_update_disconnect(worker, False)
         self._pending_update_disconnects.clear()
@@ -1708,9 +1730,10 @@ class AppController(QObject):
         text: str,
         userinfo: dict | None,
         errors: list[str] | None,
+        response_meta: dict | None = None,
     ) -> tuple[int, list[str]]:
         return apply_fetched_subscription_operation(
-            self, url, name, kind, text, userinfo, errors
+            self, url, name, kind, text, userinfo, errors, response_meta
         )
 
     def remove_subscription(self, url: str, delete_nodes: bool = True) -> None:
@@ -1800,6 +1823,21 @@ class AppController(QObject):
     def connect_selected(self, allow_during_reconnect: bool = False) -> bool:
         return connect_selected_operation(self, allow_during_reconnect=allow_during_reconnect)
 
+    def request_resume_reconnect(self, reason: str = "system resume") -> bool:
+        """Queue a reconnect for a session that was active before system sleep."""
+        settings = self.state.settings
+        if self._shutting_down or self.locked:
+            return False
+        if not bool(getattr(settings, "reconnect_after_sleep", True)):
+            return False
+        if not bool(getattr(settings, "reconnect_on_network_change", True)):
+            return False
+        if not self._desired_connected:
+            return False
+        self._resume_reconnect_pending = True
+        self._request_transition(reason)
+        return True
+
     def disconnect_current(self, disable_proxy: bool = True, emit_status: bool = True, *, fast: bool = False) -> bool:
         return disconnect_current_operation(self, disable_proxy=disable_proxy, emit_status=emit_status, fast=fast)
 
@@ -1818,6 +1856,8 @@ class AppController(QObject):
         if not current_target and self.state.settings.tun_mode and not is_process_elevated():
             self.status.emit("warning", "VPN (TUN) недоступен без прав администратора. Переключитесь на режим прокси.")
             return
+        if current_target:
+            self._resume_reconnect_pending = False
         self._desired_connected = not current_target
         self._request_transition("toggle connection")
 
@@ -2273,6 +2313,7 @@ class AppController(QObject):
         self.locked = True
         self.lock_state_changed.emit(True)
         self._desired_connected = False
+        self._resume_reconnect_pending = False
         self._request_transition("app locked")
 
     def build_diagnostics(self, *, include: dict | None = None, upload: bool = True) -> Path:
@@ -2493,6 +2534,8 @@ class AppController(QObject):
 
         if self._active_core == "singbox":
             try:
+                if try_singbox_hot_switch_selector_operation(self, reason):
+                    return True
                 return self._restart_singbox_runtime(reason)
             finally:
                 self._auto_switch_transitioning = False

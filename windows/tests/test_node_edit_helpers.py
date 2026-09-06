@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from xray_fluent.engines.singbox.config_builder import build_singbox_outbound
@@ -9,6 +11,7 @@ from xray_fluent.qml_app.bridge.node_edit_helpers import (
     build_node_updates,
     load_node_edit_fields,
     new_node_edit_fields,
+    normalized_node_export_link,
 )
 
 
@@ -429,6 +432,79 @@ def test_native_only_protocols_keep_canonical_json_link() -> None:
 
     assert updates["link"].startswith("{")
     assert parse_single(updates["link"]).outbound == updates["outbound"]
+
+
+def test_export_normalizes_json_vless_to_share_uri() -> None:
+    payload = {
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": "example.com",
+                "port": 443,
+                "users": [{"id": "json-id", "encryption": "none"}],
+            }],
+        },
+        "streamSettings": {
+            "network": "ws",
+            "security": "tls",
+            "tlsSettings": {"serverName": "front.example"},
+            "wsSettings": {"path": "/socket", "headers": {"Host": "cdn.example"}},
+        },
+    }
+    node = Node(
+        name="Imported JSON",
+        scheme="vless",
+        server="example.com",
+        port=443,
+        link=json.dumps(payload),
+        outbound=payload,
+    )
+
+    exported = normalized_node_export_link(node)
+
+    assert exported.startswith("vless://json-id@example.com:443?")
+    assert not exported.startswith("{")
+    reparsed = parse_single(exported)
+    assert reparsed.outbound == payload
+
+
+@pytest.mark.parametrize(
+    ("protocol", "native", "prefix"),
+    [
+        ("hysteria", {"type": "hysteria", "server": "example.com", "server_port": 443, "auth_str": "auth"}, "hysteria://"),
+        ("mieru", {"type": "mieru", "server": "example.com", "server_port": 443, "username": "u", "password": "p"}, "mieru://"),
+        ("naive", {"type": "naive", "server": "example.com", "server_port": 443, "username": "u", "password": "p"}, "naive://"),
+        ("anytls", {"type": "anytls", "server": "example.com", "server_port": 443, "password": "p"}, "anytls://"),
+    ],
+)
+def test_export_normalizes_native_json_protocols(protocol: str, native: dict, prefix: str) -> None:
+    node = Node(
+        name="Native JSON",
+        scheme=protocol,
+        server="example.com",
+        port=443,
+        link=json.dumps(native),
+        outbound={"protocol": protocol, "singbox": native},
+    )
+
+    exported = normalized_node_export_link(node)
+
+    assert exported.startswith(prefix)
+    assert parse_single(exported).scheme == protocol
+
+
+def test_export_keeps_full_config_as_compact_json() -> None:
+    payload = {"inbounds": [], "outbounds": [{"type": "direct", "tag": "direct"}]}
+    node = Node(
+        name="Full config",
+        scheme="singbox_config",
+        link="{\n  \"outbounds\": [{\"type\": \"direct\", \"tag\": \"direct\"}],\n  \"inbounds\": []\n}",
+        outbound={"protocol": "singbox_config", "singbox_config": payload},
+    )
+
+    exported = normalized_node_export_link(node)
+
+    assert exported == json.dumps({"outbounds": payload["outbounds"], "inbounds": []}, separators=(",", ":"))
 
 
 @pytest.mark.parametrize(
